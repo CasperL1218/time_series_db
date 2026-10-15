@@ -2,6 +2,7 @@ package com.tsdb;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 
@@ -24,17 +25,25 @@ public class TimeWindow implements Window {
     }
 
     @Override
-    public synchronized void add(DataPoint point) {
+    public synchronized List<DataPoint> add(DataPoint point) {
         buffer.addLast(point);
         long cutoff = point.getTimestampMillis() - windowMillis;
+        List<DataPoint> evicted = null;
         while (!buffer.isEmpty() && buffer.peekFirst().getTimestampMillis() < cutoff) {
-            buffer.removeFirst();
+            if (evicted == null) evicted = new ArrayList<>();
+            evicted.add(buffer.removeFirst());
         }
+        return evicted == null ? Collections.emptyList() : evicted;
     }
 
     @Override
     public synchronized List<DataPoint> contents() {
         return new ArrayList<>(buffer);
+    }
+
+    @Override
+    public synchronized int size() {
+        return buffer.size();
     }
 
     @Override
