@@ -2,6 +2,7 @@ package com.tsdb;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 
@@ -22,16 +23,26 @@ public class CountWindow implements Window {
     }
 
     @Override
-    public synchronized void add(DataPoint point) {
+    public synchronized List<DataPoint> add(DataPoint point) {
         buffer.addLast(point);
-        while (buffer.size() > capacity) {
-            buffer.removeFirst();
+        if (buffer.size() <= capacity) {
+            return Collections.emptyList();
         }
+        List<DataPoint> evicted = new ArrayList<>(1);
+        while (buffer.size() > capacity) {
+            evicted.add(buffer.removeFirst());
+        }
+        return evicted;
     }
 
     @Override
     public synchronized List<DataPoint> contents() {
         return new ArrayList<>(buffer);
+    }
+
+    @Override
+    public synchronized int size() {
+        return buffer.size();
     }
 
     @Override

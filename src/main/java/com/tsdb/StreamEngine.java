@@ -1,48 +1,82 @@
 package com.tsdb;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.function.Consumer;
 
 /**
- * Minimal in-memory stream processing engine.
+ * In-memory stream processing engine.
  *
- * Each incoming {@link DataPoint} is pushed into the active {@link Window},
- * which owns the eviction policy (count-based or time-based). After every
- * update the engine notifies an optional listener so callers (e.g. the CLI
- * driver) can display the window's current contents.
+ * Per event:  filter -> window insert/evict -> update aggregators -> notify.
  *
- * This is intentionally the whole engine for the pre-fall-break milestone:
- * no persistence, no filtering, no aggregation yet. Those are later versions
- * layered on top of processUpdate()/Window without changing this contract.
+ *  - The {@link Filter} runs first; rejected events are counted and dropped.
+ *  - The {@link Window} owns the eviction policy and reports what it evicted.
+ *  - Each {@link Aggregator} is told about the insert and every eviction, so
+ *    its result stays in sync with the window without rescanning it.
+ *  - The listener (e.g. the CLI display) is notified only when an event was
+ *    accepted, since otherwise nothing changed.
  */
 public class StreamEngine {
 
     private final Window window;
+    private final Filter filter;
+    private final List<Aggregator> aggregators;
     private Consumer<Window> onUpdate;
-    private long pointsProcessed = 0;
 
+    private long pointsProcessed = 0; // every event received
+    private long pointsFiltered = 0;  // events rejected by the filter
+
+    /** Window only: no filter, no aggregators (Version 1 behaviour). */
     public StreamEngine(Window window) {
-        this.window = window;
+        this(window, Filter.ACCEPT_ALL, Collections.emptyList());
     }
 
-    /** Registers a callback invoked after each processed update, with the window. */
+    public StreamEngine(Window window, Filter filter, List<Aggregator> aggregators) {
+        if (window == null) throw new IllegalArgumentException("window must not be null");
+        this.window = window;
+        this.filter = filter == null ? Filter.ACCEPT_ALL : filter;
+        this.aggregators = aggregators == null ? new ArrayList<>() : new ArrayList<>(aggregators);
+    }
+
+    /** Registers a callback invoked after each accepted update, with the window. */
     public void setOnUpdate(Consumer<Window> listener) {
         this.onUpdate = listener;
     }
 
-    /** Feeds one new event into the engine: insert, evict, notify. */
-    public void processUpdate(DataPoint update) {
-        window.add(update);
+    /**
+     * Feeds one new event into the engine.
+     *
+     * @return true if the event passed the filter and entered the window.
+     */
+    public boolean processUpdate(DataPoint update) {
         pointsProcessed++;
+
+        if (!filter.test(update)) {
+            pointsFiltered++;
+            return false;
+        }
+
+        List<DataPoint> evicted = window.add(update);
+
+        for (Aggregator a : aggregators) {
+            a.onInsert(update);
+        }
+        for (DataPoint e : evicted) {
+            for (Aggregator a : aggregators) {
+                a.onEvict(e);
+            }
+        }
+
         if (onUpdate != null) {
             onUpdate.accept(window);
         }
+        return true;
     }
 
-    public Window getWindow() {
-        return window;
-    }
-
-    public long getPointsProcessed() {
-        return pointsProcessed;
-    }
+    public Window getWindow() { return window; }
+    public Filter getFilter() { return filter; }
+    public List<Aggregator> getAggregators() { return Collections.unmodifiableList(aggregators); }
+    public long getPointsProcessed() { return pointsProcessed; }
+    public long getPointsFiltered() { return pointsFiltered; }
 }
