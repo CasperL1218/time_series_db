@@ -97,15 +97,22 @@ FinancialDataGenerator  --generates-->  DataPoint
   `FilterParser.toSql(filter)` writes any filter out as an SQL `WHERE`
   clause.
 
-**Aggregation (interface only; implementations are the next milestone)**
-- **`Aggregator`**: `onInsert` / `onEvict` / `result()` / `describe()`.
-  This lets aggregates like AVG or MAX update incrementally instead of
-  rescanning the window. `StreamEngine` already calls these methods; no
-  concrete aggregator classes exist yet.
+**Aggregation**
+- **`Aggregator`** — interface: `onInsert` / `onEvict` / `result()`, so
+  aggregates are updated incrementally instead of rescanning the window.
+- **`CountAgg`**, **`SumAgg`**, **`AvgAgg`** — running count / sum / mean
+  over `price` or `quantity`, O(1) per event.
+- **`MinAgg`** / **`MaxAgg`** — sliding-window min / max via a monotonic
+  deque, amortised O(1) per event (relies on FIFO eviction).
+- **`GroupByAggregator`** — one inner aggregator per `symbol` or `side`,
+  like SQL `GROUP BY`; `results()` returns a sorted map of group → value.
+- **`AggregatorParser`** — turns `"avg(price), max(qty), count GROUP BY symbol"`
+  into a list of aggregators and renders the equivalent SQL `SELECT`.
 
 **Entry points**
-- **`Main`**: CLI driver for the window-only demo (no filter).
-- **`FilterDemo`**: CLI driver for the filtered demo.
+- **`Main`** — CLI driver for the window-only demo.
+- **`FilterDemo`** — CLI driver for the filtered demo.
+- **`AggregateDemo`** — CLI driver for the filtered + aggregated demo.
 
 Everything runs in memory, with no disk I/O and no query language. Per the
 professor's guidance, the command-line arguments *are* the query.
@@ -231,6 +238,50 @@ Processed 5, passed 1, filtered out 4.
 An invalid filter prints an error and exits with status 1. For example,
 `"price>abc"` prints `Bad filter: price must be compared to a number, got 'abc'`.
 
+### Run with aggregates
+
+Same arguments as the filter demo, with the aggregate list in front. After
+each accepted event the current value of every aggregate is printed.
+
+```bash
+java -cp out com.tsdb.AggregateDemo "<aggregates>" "<filter>" <count|time> <size> [intervalMs] [numEvents] [seed]
+```
+
+- `"<aggregates>"` — comma-separated list of `count`, `sum(f)`, `avg(f)`,
+  `min(f)`, `max(f)` with `f` = `price` or `quantity` (or `qty`), optionally
+  followed by `GROUP BY symbol` or `GROUP BY side`.
+- `"<filter>"` — same syntax as above, or `""` for no filter.
+
+Examples:
+```bash
+java -cp out com.tsdb.AggregateDemo "avg(price), max(price), count" "" count 5          # last 5 trades
+java -cp out com.tsdb.AggregateDemo "min(price), max(price)" "symbol=AAPL" time 10     # AAPL price range, last 10s
+java -cp out com.tsdb.AggregateDemo "avg(price), count GROUP BY symbol" "side=BUY" count 20 50 40 42
+```
+
+The run starts by printing the equivalent SQL, e.g.:
+
+```
+SQL    : SELECT symbol, AVG(price), COUNT(*) FROM trades WHERE side = 'BUY' GROUP BY symbol
+```
+
+and each accepted event prints the window size and the aggregates:
+
+```
+  PASS  23:54:25.150 TSLA   BUY  $456.94     qty=95
+        window holds 4 point(s)
+        AVG(price) GROUP BY symbol:
+          AMZN   350.09
+          GOOG   189.46
+          TSLA   457.62
+        COUNT(*) GROUP BY symbol:
+          AMZN   1
+          GOOG   1
+          TSLA   2
+```
+
+An empty window gives `NaN` for sum/avg/min/max and `0` for count.
+
 ### Tests
 
 The tests are self-contained harnesses with no external test framework.
@@ -238,9 +289,10 @@ Each one exits with status 0 when everything passes and 1 when anything
 fails:
 
 ```bash
-java -cp out com.tsdb.WindowTest           # window eviction + engine notification  -> ALL TESTS PASSED
-java -cp out com.tsdb.EngineContractTest   # filter -> window -> aggregator contract -> ALL CONTRACT TESTS PASSED
-java -cp out com.tsdb.FilterTest           # operators, AND/OR, parsing, bad input   -> ALL 64 FILTER TESTS PASSED
+java -cp out com.tsdb.WindowTest           # window eviction            -> ALL TESTS PASSED
+java -cp out com.tsdb.EngineContractTest   # filter -> window -> aggregators contract -> ALL CONTRACT TESTS PASSED
+java -cp out com.tsdb.FilterTest           # operators, AND/OR, bad input -> ALL 64 FILTER TESTS PASSED
+java -cp out com.tsdb.AggregatorTest       # aggregates vs brute force, group by, parser -> ALL 50 AGGREGATOR TESTS PASSED
 ```
 
 ## Roadmap
@@ -252,9 +304,8 @@ VERSION 1  ✅ done
 VERSION 2  ✅ done
   Filtering (e.g. symbol = AAPL, price > 200)
 
-VERSION 3  🚧 in progress
-  Aggregations over a window (avg, min, max, count), maintained incrementally
-  (Aggregator interface + engine wiring done; implementations pending)
+VERSION 3  ✅ done
+  Aggregations over a window (count, sum, avg, min, max, group by), maintained incrementally
 
 VERSION 4  ✅ done
   Compound filter conditions (AND/OR)
