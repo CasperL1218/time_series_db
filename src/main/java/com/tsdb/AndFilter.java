@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-/** Passes a point only if all subfilters filter pass. */
+/** Passes a point only if every child filter passes (short-circuits on the first failure). */
 public final class AndFilter implements Filter {
 
     private final List<Filter> children;

@@ -4,10 +4,11 @@ package com.tsdb;
  * An incrementally maintained aggregate over the current window contents.
  *
  * The engine calls onInsert() for every point that enters the window and
- * onEvict() for every point the window drops, in that order, so result()
+ * then onEvict() for every point that insert pushed out, so result()
  * always reflects exactly window.contents() -- without rescanning it.
  *
- * Owner: Person 2 (CountAgg, SumAgg, AvgAgg, MinAgg, MaxAgg, GroupByAggregator).
+ * No implementations exist yet. Planned (owner: Person 2): CountAgg, SumAgg,
+ * AvgAgg, MinAgg, MaxAgg, GroupByAggregator.
  */
 public interface Aggregator {
 

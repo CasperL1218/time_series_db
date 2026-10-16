@@ -45,7 +45,8 @@ public class StreamEngine {
     }
 
     /**
-     * Feeds one new event into the engine.
+     * Feeds one new event into the engine. Aggregators get onInsert for the
+     * new point first, then onEvict for each point it pushed out, oldest first.
      *
      * @return true if the event passed the filter and entered the window.
      */

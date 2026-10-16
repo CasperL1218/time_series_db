@@ -12,11 +12,15 @@ Unlike a traditional database, where data sits still and queries come and
 go, a stream processing engine keeps a **standing query** and updates its
 answer as each new event arrives.
 
-**Status:** sliding windows (V1) and filtering with AND/OR conditions
-(V2 + V4) are implemented. Aggregation and persistence are later
-milestones (see [Roadmap](#roadmap) below).
+**Status:**
+- ✅ Sliding windows, count-based and time-based (V1)
+- ✅ Filtering, with compound AND/OR conditions (V2 + V4)
+- 🚧 Aggregation (V3): the `Aggregator` interface is wired into the engine
+  and covered by contract tests, but no concrete aggregators (AVG, MIN,
+  MAX, ...) exist yet
+- ⏳ Persistence is a later milestone (see [Roadmap](#roadmap))
 
-The team is composed of four members: Casper Liao, Daniel Zlotnick, Saanvi
+The team has four members: Casper Liao, Daniel Zlotnick, Saanvi
 Ibrahimpatnam, and Jasmine Li.
 
 ## Current Milestone: Pre-Fall-Break Deliverable
@@ -47,57 +51,77 @@ FinancialDataGenerator  --generates-->  DataPoint
                                (last N points)  (last T seconds)
                                             |
                                             v
-                                     Aggregator(s)  (interface)     -- onInsert / onEvict (next milestone)
+                                     Aggregator(s)  (interface)     -- onInsert(new), then onEvict(each evicted)
                                             |
                                             v
-                                   display current contents
+                              onUpdate listener (e.g. CLI display)  -- only called for accepted events
 ```
 
 **Core**
-- **`DataPoint`** — an immutable `(timestamp, symbol, price, quantity, side)`
-  event. Data is never mutated once created, consistent with the project's
-  append-only philosophy.
-- **`FinancialDataGenerator`** — simulates a market feed: randomly picks a
-  symbol, buy/sell side, quantity, and a price that random-walks per symbol
-  so the series looks realistic.
-- **`StreamEngine`** — the core engine. For each event,
+- **`DataPoint`**: an immutable `(timestamp, symbol, price, quantity, side)`
+  trade event, where `side` is `BUY` or `SELL`. A point is never changed
+  after it is created, which fits the project's append-only design.
+- **`FinancialDataGenerator`**: simulates a market feed. Each call to
+  `next()` picks one of `AAPL, MSFT, GOOG, NVDA, AMZN, TSLA`, a side, a
+  quantity in `[1, 500]`, and a price that does a ±$1 random walk per
+  symbol (starting somewhere in $50–$500). The generator keeps its own
+  **simulated clock**, which moves forward by a random delta in
+  `[minDelta, maxDelta)` ms per event. Pass it a `Random` with a fixed
+  seed and it produces the same sequence every time.
+- **`StreamEngine`**: the core engine. For each event,
   `processUpdate(DataPoint)` runs **filter → window insert/evict →
-  aggregators → notify listener**. It returns whether the event was
-  accepted and tracks how many events were processed and filtered out.
+  aggregators → notify listener**. It returns `true` if the event passed
+  the filter, and it counts how many events were processed in total and
+  how many the filter rejected.
 
 **Windows**
-- **`Window`** — interface shared by both window types: `add()` inserts a
+- **`Window`**: the interface both window types share. `add()` inserts a
   point, evicts whatever no longer belongs, and **returns the evicted
-  points** (so aggregators can stay in sync); `contents()` returns the
-  current window, oldest first.
-  - **`CountWindow`** — keeps the most recent `N` points in a `Deque`.
-  - **`TimeWindow`** — keeps all points within `T` seconds of the latest
-    point seen, in a `Deque`.
+  points**, oldest first, so aggregators can stay in sync. `contents()`
+  returns a copy of the current window, oldest first.
+  - **`CountWindow`**: keeps the most recent `N` points in a `Deque`.
+  - **`TimeWindow`**: keeps every point whose timestamp is within `T` ms
+    of the **latest point's timestamp**, not wall-clock time. The boundary
+    is inclusive, so a point exactly `T` ms old stays in the window.
 
 **Filtering**
-- **`Filter`** — interface: `test(DataPoint)` decides whether an event
-  enters the window. `Filter.ACCEPT_ALL` is the default (no filter).
-- **`FieldFilter`** — one comparison on `symbol`, `side`, `price`, or
-  `quantity` using `= != > < >= <=`.
-- **`AndFilter` / `OrFilter`** — combine conditions (short-circuiting).
-- **`FilterParser`** — turns a string like `"symbol=AAPL AND price>200"`
-  into a `Filter`, with clear error messages for invalid input. Also
-  renders any filter as an SQL `WHERE` clause.
+- **`Filter`**: an interface whose `test(DataPoint)` decides whether an
+  event enters the window. `Filter.ACCEPT_ALL` is the default (no filter).
+- **`FieldFilter`**: one comparison on `symbol`, `side`, `price`, or
+  `quantity` using `= != > < >= <=`. Text values are compared without
+  regard to case.
+- **`AndFilter` / `OrFilter`**: combine conditions and stop evaluating as
+  soon as the result is known (short-circuit).
+- **`FilterParser`**: turns a string like `"symbol=AAPL AND price>200"`
+  into a `Filter` and gives a clear error message for invalid input.
+  `FilterParser.toSql(filter)` writes any filter out as an SQL `WHERE`
+  clause.
 
-**Aggregation (interface only — implementation is the next milestone)**
-- **`Aggregator`** — `onInsert` / `onEvict` / `result()`, so aggregates
-  like AVG or MAX are updated incrementally instead of rescanning the window.
+**Aggregation (interface only; implementations are the next milestone)**
+- **`Aggregator`**: `onInsert` / `onEvict` / `result()` / `describe()`.
+  This lets aggregates like AVG or MAX update incrementally instead of
+  rescanning the window. `StreamEngine` already calls these methods; no
+  concrete aggregator classes exist yet.
 
 **Entry points**
-- **`Main`** — CLI driver for the window-only demo.
-- **`FilterDemo`** — CLI driver for the filtered demo.
+- **`Main`**: CLI driver for the window-only demo (no filter).
+- **`FilterDemo`**: CLI driver for the filtered demo.
 
-Everything lives in memory — no disk I/O and no query language. Per the
+Everything runs in memory, with no disk I/O and no query language. Per the
 professor's guidance, the command-line arguments *are* the query.
+
+### Project Layout
+
+```
+src/main/java/com/tsdb/   engine, windows, filters, generator, CLI drivers
+src/test/java/com/tsdb/   self-contained test harnesses (each has a main())
+out/                      compiled classes (git-ignored)
+```
 
 ### Build
 
-Requires only a JDK (no external dependencies, no build tool needed):
+You only need a **JDK 16 or newer** (the tests use `Stream.toList()`).
+There are no external dependencies and no build tool:
 
 ```bash
 rm -rf out
@@ -116,11 +140,18 @@ javac -d out (Get-ChildItem -Recurse -Filter *.java src/main/java,src/test/java)
 java -cp out com.tsdb.Main <count|time> <size> [intervalMs] [numEvents]
 ```
 
-- `count <N>` — keep the most recent `N` data points.
-- `time <seconds>` — keep data points from the last `<seconds>` seconds.
-- `intervalMs` — delay between simulated events, in ms (default `400`).
-- `numEvents` — number of events to simulate; `0` or omitted runs forever
-  (stop with Ctrl+C). Pass a positive number for a short, reproducible demo.
+- `count <N>`: keep the most recent `N` data points.
+- `time <seconds>`: keep data points from the last `<seconds>` seconds of
+  event time.
+- `intervalMs`: real delay between simulated events, in ms (default `400`).
+- `numEvents`: number of events to simulate. `0` or omitted runs forever
+  (stop with Ctrl+C); pass a positive number for a short demo.
+
+The simulated clock starts at the current time and moves forward by a
+random amount between `intervalMs/2` and `2*intervalMs` per event. Event
+timestamps therefore advance at roughly the same rate as real time, but
+not exactly. Time windows always use these event timestamps, not the wall
+clock.
 
 Examples:
 ```bash
@@ -129,29 +160,39 @@ java -cp out com.tsdb.Main time 10          # keep the last 10 seconds of trades
 java -cp out com.tsdb.Main count 5 50 8     # short, fast demo: 8 events, 50ms apart
 ```
 
-Each tick prints the incoming event and the full current window, e.g.:
+Each tick prints the incoming event and the full current window:
 
 ```
-Incoming: 11:55:30.977 TSLA   BUY  $438.11     qty=140
-Current window (2 point(s)):
-  11:55:30.888 AAPL   BUY  $404.16     qty=391
-  11:55:30.977 TSLA   BUY  $438.11     qty=140
+Stream engine started: count-based window (last 2 point(s))
+Simulating 3 event(s).
+
+Incoming: 10:18:03.797 AMZN   BUY  $144.18     qty=39
+Current window (1 point(s)):
+  10:18:03.797 AMZN   BUY  $144.18     qty=39
+
+...
+
+Shutting down. Processed 3 event(s).
 ```
 
 ### Run with a filter
 
-Only trades that match the filter enter the window; everything else is
-skipped and never takes up window space.
+Only trades that match the filter enter the window. Every other trade is
+skipped, so it never takes up window space and never evicts anything.
 
 ```bash
 java -cp out com.tsdb.FilterDemo "<filter>" <count|time> <size> [intervalMs] [numEvents] [seed]
 ```
 
-- `"<filter>"` — which trades to keep, in quotes (see syntax below). Use `""` for no filter.
-- `count <N>` / `time <seconds>` — window type and size, same as above.
-- `intervalMs` — delay between simulated events, in ms (default `400`).
-- `numEvents` — number of events to simulate; `0` or omitted runs forever (Ctrl+C to stop).
-- `seed` — optional random seed; the same seed produces the same trades every run.
+- `"<filter>"`: which trades to keep, in quotes (syntax below). Use `""`
+  for no filter.
+- `count <N>` / `time <seconds>`: window type and size, same as above.
+- `intervalMs`: real delay between simulated events, in ms (default `400`).
+- `numEvents`: number of events to simulate. `0` or omitted runs forever
+  (Ctrl+C to stop).
+- `seed`: optional random seed. The same seed produces the same sequence
+  of symbols, sides, prices, and quantities every run. Timestamps still
+  start at the current time, so they differ between runs.
 
 Examples:
 ```bash
@@ -165,28 +206,41 @@ java -cp out com.tsdb.FilterDemo "symbol=AAPL OR symbol=NVDA" count 5 300 30 42 
 | Part | Options |
 |---|---|
 | Fields | `symbol`, `side`, `price`, `quantity` (or `qty`) |
-| Operators | `=` `!=` `>` `<` `>=` `<=` (text fields `symbol`/`side` only allow `=` and `!=`) |
-| Combine | `AND`, `OR` — AND binds tighter than OR, like SQL. No parentheses. |
-| Values | Case-insensitive; quotes optional (`symbol='AAPL'`); `side` must be `BUY` or `SELL` |
+| Operators | `=` (or `==`) `!=` `>` `<` `>=` `<=`. The text fields `symbol` and `side` only allow `=` and `!=` |
+| Combine | `AND`, `OR`. AND binds tighter than OR, like SQL. No parentheses. |
+| Values | Case-insensitive; quotes are optional (`symbol='AAPL'`); no spaces inside a value; `side` must be `BUY` or `SELL`; numbers must be finite |
 
-Each event is printed as `PASS` (entered the window) or `skip` (filtered
-out), and the run starts by printing the equivalent SQL, e.g.:
+The run first prints the window, the filter, and the equivalent SQL. It
+then marks each event `PASS` (entered the window, followed by the
+window's contents) or `skip` (filtered out), and ends with a summary:
 
 ```
-Filter : symbol=AAPL AND price>200
-SQL    : SELECT * FROM trades WHERE symbol = 'AAPL' AND price > 200
+Window : count-based window (last 2 point(s))
+Filter : symbol=AAPL OR symbol=NVDA
+SQL    : SELECT * FROM trades WHERE symbol = 'AAPL' OR symbol = 'NVDA'
+
+  PASS  10:18:03.970 AAPL   SELL $377.17     qty=33
+        window now holds 1 point(s):
+          10:18:03.970 AAPL   SELL $377.17     qty=33
+  skip  10:18:03.986 TSLA   SELL $457.36     qty=227
+  ...
+
+Processed 5, passed 1, filtered out 4.
 ```
 
-An invalid filter (e.g. `"price>abc"`) prints a clear error and exits.
+An invalid filter prints an error and exits with status 1. For example,
+`"price>abc"` prints `Bad filter: price must be compared to a number, got 'abc'`.
 
 ### Tests
 
-Self-contained test harnesses (no external test framework):
+The tests are self-contained harnesses with no external test framework.
+Each one exits with status 0 when everything passes and 1 when anything
+fails:
 
 ```bash
-java -cp out com.tsdb.WindowTest           # window eviction            -> ALL TESTS PASSED
-java -cp out com.tsdb.EngineContractTest   # filter -> window -> aggregators contract -> ALL CONTRACT TESTS PASSED
-java -cp out com.tsdb.FilterTest           # operators, AND/OR, bad input -> ALL 64 FILTER TESTS PASSED
+java -cp out com.tsdb.WindowTest           # window eviction + engine notification  -> ALL TESTS PASSED
+java -cp out com.tsdb.EngineContractTest   # filter -> window -> aggregator contract -> ALL CONTRACT TESTS PASSED
+java -cp out com.tsdb.FilterTest           # operators, AND/OR, parsing, bad input   -> ALL 64 FILTER TESTS PASSED
 ```
 
 ## Roadmap
@@ -198,8 +252,9 @@ VERSION 1  ✅ done
 VERSION 2  ✅ done
   Filtering (e.g. symbol = AAPL, price > 200)
 
-VERSION 3  (in progress)
+VERSION 3  🚧 in progress
   Aggregations over a window (avg, min, max, count), maintained incrementally
+  (Aggregator interface + engine wiring done; implementations pending)
 
 VERSION 4  ✅ done
   Compound filter conditions (AND/OR)
@@ -207,7 +262,7 @@ VERSION 4  ✅ done
 VERSION 5 / final project
   Persistence to disk, larger datasets, real financial data,
   more advanced queries (range queries, OHLC bucketed aggregation,
-  multi-series alignment) — see "Original Proposal" below.
+  multi-series alignment). See "Original Proposal" below.
 ```
 
 ## Original Proposal (Future Direction)

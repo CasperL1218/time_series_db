@@ -5,13 +5,14 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Checks the Step 0 contracts every teammate builds on:
+ * Checks the Step 0 engine contracts every teammate builds on:
  *  - Window.add() returns exactly the evicted points, oldest first
  *  - StreamEngine filters before the window
  *  - Aggregators see every insert and every eviction, so a running result
  *    always matches a brute-force recompute over window.contents()
  *
  * Run with:  java -cp out com.tsdb.EngineContractTest
+ * Exits with status 0 if all pass, otherwise prints each failure and exits 1.
  */
 public class EngineContractTest {
 
@@ -85,7 +86,7 @@ public class EngineContractTest {
                 if (Math.abs(brute - sum.result()) > 1e-6) { ok = false; break; }
             }
             check("aggregator in sync with " + w.describe(), ok, true);
-            // reset for next window type
+            // drain the shared aggregator so the next window type starts from zero
             for (DataPoint p : w.contents()) sum.onEvict(p);
         }
     }

@@ -15,12 +15,14 @@ import java.util.regex.Pattern;
  *   condition := field op value
  *   field     := symbol | side | price | quantity | qty
  *   op        := = | == | != | > | < | >= | <=
+ *   value     := a single token, optionally quoted (no spaces or = < > !)
  * </pre>
  * AND binds tighter than OR, like SQL:
  * {@code symbol=AAPL AND price>200 OR symbol=NVDA} means
  * {@code (symbol=AAPL AND price>200) OR symbol=NVDA}.
  *
- * Values may be quoted ('AAPL' or "AAPL"). Spaces around operators are fine.
+ * Values may be quoted ('AAPL' or "AAPL"). Spaces around operators are fine,
+ * but AND/OR must be surrounded by whitespace.
  * A null/blank string returns {@link Filter#ACCEPT_ALL}.
  * Any malformed input throws IllegalArgumentException with a readable message.
  */
@@ -34,6 +36,10 @@ public final class FilterParser {
 
     private FilterParser() {}
 
+    /**
+     * Parses a full filter expression. Returns a FieldFilter, AndFilter or
+     * OrFilter (single-element groups are not wrapped), or ACCEPT_ALL if blank.
+     */
     public static Filter parse(String text) {
         if (text == null || text.trim().isEmpty()) {
             return Filter.ACCEPT_ALL;
@@ -96,6 +102,7 @@ public final class FilterParser {
         return render(f, true);
     }
 
+    /** describe() form, or SQL form when {@code sql} is true; used by AndFilter/OrFilter to render children. */
     static String render(Filter f, boolean sql) {
         if (!sql) return f.describe();
         if (f instanceof FieldFilter) return ((FieldFilter) f).toSql();
@@ -104,6 +111,7 @@ public final class FilterParser {
         return f.describe();
     }
 
+    /** The split patterns need whitespace on both sides, so a leading/trailing AND/OR must be caught here. */
     private static void rejectDanglingKeyword(String s) {
         String u = " " + s.toUpperCase(java.util.Locale.ROOT) + " ";
         if (u.matches("^\\s*(AND|OR)\\s.*") || u.matches(".*\\s(AND|OR)\\s*$")) {
@@ -111,6 +119,7 @@ public final class FilterParser {
         }
     }
 
+    /** Strips one pair of matching single or double quotes, if present. */
     private static String unquote(String v) {
         String t = v.trim();
         if (t.length() >= 2 && ((t.startsWith("'") && t.endsWith("'")) || (t.startsWith("\"") && t.endsWith("\"")))) {

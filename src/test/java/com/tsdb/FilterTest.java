@@ -4,9 +4,14 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Tests for the filtering layer
- * use expect function for the many filter-on-trade tests
- * use check function for other tests (e.g. parser, describe, sql)
+ * Tests for the filtering layer: operators, boundaries, parser formatting,
+ * AND/OR precedence, describe()/toSql(), engine integration, and bad input.
+ *
+ * Helpers: expect() parses a filter and tests it against one trade; bad()
+ * asserts that parsing throws; check() covers everything else.
+ *
+ * Run with:  java -cp out com.tsdb.FilterTest
+ * Exits with status 0 if all pass, otherwise prints each failure and exits 1.
  */
 public class FilterTest {
 
@@ -64,7 +69,7 @@ public class FilterTest {
         expect("quantity>100", AAPL_SELL_150_400, true);
         expect("quantity<100", NVDA_BUY_200_50, true);
         expect("quantity=50",  NVDA_BUY_200_50, true);
-        expect("qty<=100",     AAPL_BUY_250_100, true);   
+        expect("qty<=100",     AAPL_BUY_250_100, true);   // qty alias
     }
 
     private static void testBoundaries() {
@@ -96,7 +101,7 @@ public class FilterTest {
     }
 
     private static void testPrecedence() {
-        // and/or tests
+        // AND binds tighter than OR: (symbol=AAPL AND price>200) OR symbol=NVDA
         String q = "symbol=AAPL AND price>200 OR symbol=NVDA";
         expect(q, AAPL_BUY_250_100, true);    // left group
         expect(q, NVDA_BUY_200_50, true);     // right group

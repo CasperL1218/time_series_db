@@ -4,11 +4,14 @@ import java.util.Locale;
 
 /**
  * A single comparison between one field of a {@link DataPoint} and a constant,
- * example: {@code symbol=AAPL}, {@code side!=SELL}, {@code price>200},
+ * e.g. {@code symbol=AAPL}, {@code side!=SELL}, {@code price>200},
  * {@code quantity<=100}.
  *
  * Text fields (symbol, side) support only = and !=.
  * Numeric fields (price, quantity) support = != > < >= <=.
+ *
+ * Text values are normalized to upper case and compared case-insensitively;
+ * side must be BUY or SELL. Invalid combinations throw IllegalArgumentException.
  */
 public final class FieldFilter implements Filter {
 
@@ -54,6 +57,7 @@ public final class FieldFilter implements Filter {
             }
         }
 
+        /** Applies this operator to a compareTo-style result (negative, zero, positive). */
         boolean compare(int cmp) {
             switch (this) {
                 case EQ: return cmp == 0;
@@ -69,7 +73,7 @@ public final class FieldFilter implements Filter {
 
     private final Field field;
     private final Op op;
-    private final String textValue;   // used when field is symbol or side
+    private final String textValue;   // used when field is symbol or side (upper-cased)
     private final double numValue;    // used when field is price or quantity
 
     /** Text comparison: symbol or side. */
@@ -131,6 +135,7 @@ public final class FieldFilter implements Filter {
         return field.label() + " " + (op == Op.NE ? "<>" : op.symbol) + " " + v;
     }
 
+    /** Value as text; whole numbers print without a trailing ".0" (200, not 200.0). */
     private String valueText() {
         if (!field.numeric) return textValue;
         return numValue == Math.rint(numValue) ? String.valueOf((long) numValue) : String.valueOf(numValue);

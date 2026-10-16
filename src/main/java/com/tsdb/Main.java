@@ -3,10 +3,12 @@ package com.tsdb;
 import java.util.List;
 
 /**
- * CLI demo driver for the pre-fall-break milestone.
+ * CLI demo driver for the pre-fall-break milestone: window only, no filter
+ * (see FilterDemo for the filtered version). Prints each incoming event and
+ * the full window after every update.
  *
  * Usage:
- *   java com.tsdb.Main <count|time> <size> [intervalMs] [numEvents]
+ *   java -cp out com.tsdb.Main <count|time> <size> [intervalMs] [numEvents]
  *
  *   count <N>        keep the most recent N data points
  *   time  <seconds>  keep data points from the last <seconds> seconds
@@ -14,8 +16,8 @@ import java.util.List;
  *   numEvents        number of events to simulate; 0 or omitted = run until Ctrl+C
  *
  * Examples:
- *   java com.tsdb.Main count 5
- *   java com.tsdb.Main time 10
+ *   java -cp out com.tsdb.Main count 5
+ *   java -cp out com.tsdb.Main time 10
  */
 public class Main {
 
@@ -48,6 +50,7 @@ public class Main {
         StreamEngine engine = new StreamEngine(window);
         engine.setOnUpdate(Main::display);
 
+        // Simulated clock advances intervalMs/2 .. 2*intervalMs per event, roughly tracking real time.
         FinancialDataGenerator generator = new FinancialDataGenerator(
                 System.currentTimeMillis(), Math.max(1, intervalMs / 2), Math.max(2, intervalMs * 2));
 

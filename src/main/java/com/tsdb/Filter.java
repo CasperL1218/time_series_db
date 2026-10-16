@@ -4,7 +4,8 @@ package com.tsdb;
  * A predicate over incoming events. The engine applies the filter BEFORE the
  * window, so rejected events never occupy window space or reach aggregators.
  *
- * Owner: Person 1 (FieldFilter, AndFilter, OrFilter, FilterParser).
+ * Implementations: FieldFilter, AndFilter, OrFilter (built by FilterParser).
+ * Owner: Person 1.
  */
 public interface Filter {
 

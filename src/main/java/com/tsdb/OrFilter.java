@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-/** Passes a point if any child filter passes. */
+/** Passes a point if any child filter passes (short-circuits on the first match). */
 public final class OrFilter implements Filter {
 
     private final List<Filter> children;
@@ -29,7 +29,7 @@ public final class OrFilter implements Filter {
         return join(false);
     }
 
-    /** SQL-style form; AND groups are wrapped in () as a design choice for clarrity. */
+    /** SQL-style form; AND groups are wrapped in () for clarity, even though AND already binds tighter. */
     public String toSql() {
         return join(true);
     }

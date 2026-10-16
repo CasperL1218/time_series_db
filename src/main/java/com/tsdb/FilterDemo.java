@@ -1,8 +1,15 @@
 package com.tsdb;
 
 /**
- * Stand-alone demo for the filtering layer w/o main for testing and sharing).
- * Main will later call FilterParser.parse() for its --where flag.
+ * Stand-alone CLI demo for the filtering layer, kept separate from Main so it
+ * can be run and shared on its own. Main does not take a filter yet; the plan
+ * is for it to call FilterParser.parse() for a future --where flag.
+ *
+ * Prints the window, the filter and its SQL form, then marks each generated
+ * event PASS (entered the window, followed by the window contents) or skip
+ * (rejected by the filter), and ends with processed/passed/filtered counts.
+ * The optional seed makes the generated trades repeatable; timestamps still
+ * start at the current time.
  *
  * Usage:
  *   java -cp out com.tsdb.FilterDemo "<filter>" <count|time> <size> [intervalMs] [numEvents] [seed]

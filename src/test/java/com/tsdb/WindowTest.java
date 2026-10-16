@@ -5,7 +5,8 @@ import java.util.Objects;
 
 /**
  * Lightweight self-contained test harness (no external framework required)
- * covering the eviction semantics of CountWindow and TimeWindow.
+ * covering the eviction semantics of CountWindow and TimeWindow, plus basic
+ * StreamEngine counting and listener notification.
  *
  * Run with:  java -cp out com.tsdb.WindowTest
  * Exits with status 0 and prints "ALL TESTS PASSED" if everything checks out,

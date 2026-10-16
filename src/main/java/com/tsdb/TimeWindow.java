@@ -11,6 +11,9 @@ import java.util.List;
  * most recently added point. "Now" is defined as the timestamp of the latest
  * point seen, rather than wall-clock time, so the window behaves correctly
  * for both live and synthetic/replayed streams.
+ *
+ * The boundary is inclusive: a point exactly {@code windowMillis} older than
+ * the latest point is kept. Assumes points arrive in timestamp order.
  */
 public class TimeWindow implements Window {
 

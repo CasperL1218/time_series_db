@@ -7,6 +7,10 @@ import java.util.Random;
  * Prof. Trummer's guidance: randomly pick a symbol, a buy/sell side, a
  * quantity, and a price (via a small random walk per symbol so the series
  * looks realistic instead of pure noise).
+ *
+ * Timestamps come from a simulated clock that starts at {@code startMillis}
+ * and advances by a random delta in [minDeltaMillis, maxDeltaMillis) per
+ * event, independent of real time. Pass a seeded Random for repeatable output.
  */
 public class FinancialDataGenerator {
 
