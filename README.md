@@ -15,9 +15,10 @@ answer as each new event arrives.
 **Status:**
 - ✅ Sliding windows, count-based and time-based (V1)
 - ✅ Filtering, with compound AND/OR conditions (V2 + V4)
-- 🚧 Aggregation (V3): the `Aggregator` interface is wired into the engine
-  and covered by contract tests, but no concrete aggregators (AVG, MIN,
-  MAX, ...) exist yet
+- ✅ Incremental aggregation: COUNT, SUM, AVERAGE, MIN, MAX, and GROUP BY (V3)
+- ✅ Interactive shell: `GENERATE DATA window=count size=20` starts the
+  generator, then queries (`FILTER ticker = AAPL AND price < 200 AGGREGATE AVERAGE`,
+  `ALSO FILTER ...`) run against the moving window from the same terminal
 - ⏳ Persistence is a later milestone (see [Roadmap](#roadmap))
 
 The team has four members: Casper Liao, Daniel Zlotnick, Saanvi
@@ -32,7 +33,13 @@ Ibrahimpatnam, and Jasmine Li.
 > contents. Window type and size are configurable via command-line
 > arguments.
 
+In this project the window type and size are the `window=` and `size=`
+parameters of the shell's `GENERATE DATA` command (see
+[Run the shell](#run-the-shell)).
+
 ### Architecture
+
+Each `StreamEngine` runs one event through this pipeline:
 
 ```
 FinancialDataGenerator  --generates-->  DataPoint
@@ -54,7 +61,17 @@ FinancialDataGenerator  --generates-->  DataPoint
                                      Aggregator(s)  (interface)     -- onInsert(new), then onEvict(each evicted)
                                             |
                                             v
-                              onUpdate listener (e.g. CLI display)  -- only called for accepted events
+                                    onUpdate listener               -- the shell's live view; only called for accepted events
+```
+
+The shell runs the generator on a background thread and feeds every trade
+to **two** engines with the same window type and size:
+
+```
+                           +--> StreamEngine "all"    (no filter)           keeps every trade, so a new FILTER
+FinancialDataGenerator ----+                                                can start from the whole window
+  (background thread)      +--> StreamEngine "query"  (current filter       what WINDOW and the aggregates show;
+                                                       + aggregators)       rebuilt by every query command
 ```
 
 **Core**
@@ -87,40 +104,46 @@ FinancialDataGenerator  --generates-->  DataPoint
 **Filtering**
 - **`Filter`**: an interface whose `test(DataPoint)` decides whether an
   event enters the window. `Filter.ACCEPT_ALL` is the default (no filter).
-- **`FieldFilter`**: one comparison on `symbol`, `side`, `price`, or
-  `quantity` using `= != > < >= <=`. Text values are compared without
-  regard to case.
+- **`FieldFilter`**: one comparison on `symbol` (also called `ticker`),
+  `side`, `price`, or `quantity` using `= != > < >= <=`. Text values are
+  compared without regard to case.
 - **`AndFilter` / `OrFilter`**: combine conditions and stop evaluating as
   soon as the result is known (short-circuit).
-- **`FilterParser`**: turns a string like `"symbol=AAPL AND price>200"`
+- **`FilterParser`**: turns a condition like `"ticker = AAPL AND price < 200"`
   into a `Filter` and gives a clear error message for invalid input.
-  `FilterParser.toSql(filter)` writes any filter out as an SQL `WHERE`
-  clause.
 
 **Aggregation**
-- **`Aggregator`** — interface: `onInsert` / `onEvict` / `result()`, so
-  aggregates are updated incrementally instead of rescanning the window.
-- **`CountAgg`**, **`SumAgg`**, **`AvgAgg`** — running count / sum / mean
-  over `price` or `quantity`, O(1) per event.
-- **`MinAgg`** / **`MaxAgg`** — sliding-window min / max via a monotonic
-  deque, amortised O(1) per event (relies on FIFO eviction).
-- **`GroupByAggregator`** — one inner aggregator per `symbol` or `side`,
-  like SQL `GROUP BY`; `results()` returns a sorted map of group → value.
-- **`AggregatorParser`** — turns `"avg(price), max(qty), count GROUP BY symbol"`
-  into a list of aggregators and renders the equivalent SQL `SELECT`.
+- **`Aggregator`**: an interface with `onInsert` / `onEvict` / `result()`
+  / `describe()`. The engine calls `onInsert` for each accepted point, then
+  `onEvict` for each point that insert pushed out (oldest first), so the
+  result always matches the window without rescanning it. `result()` is
+  `NaN` for an empty window.
+- **`FieldAggregator`**: shared base for aggregators over one numeric
+  field (`price` or `quantity`). It rejects text fields and builds the
+  `NAME field` label, e.g. `AVERAGE price`.
+- **`CountAgg`**, **`SumAgg`**, **`AvgAgg`**: running count / sum /
+  average, O(1) per event. `CountAgg` returns `0` (not `NaN`) for an empty
+  window.
+- **`MinAgg`** / **`MaxAgg`**: sliding-window min / max built on
+  **`ExtremumAgg`**, a monotonic deque that drops points the new point
+  beats or ties. Amortised O(1) per event; relies on FIFO eviction.
+- **`GroupByAggregator`**: one inner aggregator per distinct `symbol` or
+  `side`, for the shell's `GROUP BY`. A group appears with its first point
+  and disappears when its last point is evicted. `results()` returns a
+  sorted map of group → value; `result()` throws, since there is no single
+  value.
 
-**Entry points**
-- **`Main`** — CLI driver for the window-only demo.
-- **`FilterDemo`** — CLI driver for the filtered demo.
-- **`AggregateDemo`** — CLI driver for the filtered + aggregated demo.
+**Entry point**
+- **`Shell`**: the interactive shell described below. It parses the
+  commands (aggregates itself, conditions with `FilterParser`), runs the
+  generator thread and the two engines, and prints the live views.
 
-Everything runs in memory, with no disk I/O and no query language. Per the
-professor's guidance, the command-line arguments *are* the query.
+Everything runs in memory, with no disk I/O.
 
 ### Project Layout
 
 ```
-src/main/java/com/tsdb/   engine, windows, filters, generator, CLI drivers
+src/main/java/com/tsdb/   shell, engine, windows, filters, aggregators, generator
 src/test/java/com/tsdb/   self-contained test harnesses (each has a main())
 out/                      compiled classes (git-ignored)
 ```
@@ -141,146 +164,129 @@ Remove-Item -Recurse -Force out -ErrorAction SilentlyContinue
 javac -d out (Get-ChildItem -Recurse -Filter *.java src/main/java,src/test/java).FullName
 ```
 
-### Run (window only)
+### Run the shell
+
+The shell runs the data generator and the queries in one terminal. The
+generator works in the background. `WINDOW` and `AGGREGATE` are **live**:
+they print their result right away and again as the window moves (the
+window after every trade, an aggregate line whenever a value changes),
+until you press **Enter** (an empty line) or type another command, which
+replaces them. `GENERATE DATA` and a `FILTER` without `AGGREGATE` print one
+line and return to the prompt.
 
 ```bash
-java -cp out com.tsdb.Main <count|time> <size> [intervalMs] [numEvents]
+java -cp out com.tsdb.Shell
 ```
 
-- `count <N>`: keep the most recent `N` data points.
-- `time <seconds>`: keep data points from the last `<seconds>` seconds of
-  event time.
-- `intervalMs`: real delay between simulated events, in ms (default `400`).
-- `numEvents`: number of events to simulate. `0` or omitted runs forever
-  (stop with Ctrl+C); pass a positive number for a short demo.
+| Command | What it does |
+|---|---|
+| `GENERATE DATA window=<count\|time> size=<n> [interval=<ms>] [events=<n>]` | Start generating trades in the background. Labels can come in any order, and spaces around `=` are fine. `window=count size=N` keeps the last `N` trades; `window=time size=S` keeps the last `S` seconds of trades. `interval`: about how often a trade arrives, in ms (default `400`). `events`: how many trades to make (`0` or omitted = until `STOP DATA`). |
+| `WINDOW` | Watch the current query's window trade by trade: the trades that match the current filter. |
+| `AGGREGATE <aggregates>` | Watch aggregates over the current query's window. Aggregates are `AVERAGE`, `SUM`, `MIN`, `MAX` (each optionally followed by `price` or `qty`; `price` is the default) and `COUNT`, separated by commas: `AGGREGATE AVERAGE, MAX qty, COUNT`. `AVG` works too. |
+| `AGGREGATE <aggregates> GROUP BY symbol\|side` | One value per ticker (or per side) for every aggregate in the list: `AGGREGATE AVERAGE, COUNT GROUP BY symbol`. `ticker` works too. `GROUP BY` goes last. |
+| `FILTER <condition> [AGGREGATE <aggregates>]` | Start a **new** query over everything in the window: only the matching trades, now and as they arrive. Prints how many trades match; with `AGGREGATE`, watches the aggregates. `FILTER NONE` goes back to the whole window. |
+| `ALSO FILTER <condition> [AGGREGATE <aggregates>]` | **Narrow** the current query: after `FILTER ticker = AAPL`, `ALSO FILTER price < 200` gives `ticker = AAPL AND price < 200`. Keeps (and watches) the query's aggregates unless you give new ones. Can be repeated. |
+| Enter (empty line) | Stop watching. The generator keeps running. |
+| `STOP DATA` | Stop the generator. The window stays and can still be queried (each query then prints once); `GENERATE DATA` starts over with a new window. |
+| `HELP`, `EXIT` | List the commands; quit. |
 
-The simulated clock starts at the current time and moves forward by a
-random amount between `intervalMs/2` and `2*intervalMs` per event. Event
-timestamps therefore advance at roughly the same rate as real time, but
-not exactly. Time windows always use these event timestamps, not the wall
-clock.
-
-Examples:
-```bash
-java -cp out com.tsdb.Main count 5          # keep the last 5 trades, run until Ctrl+C
-java -cp out com.tsdb.Main time 10          # keep the last 10 seconds of trades
-java -cp out com.tsdb.Main count 5 50 8     # short, fast demo: 8 events, 50ms apart
-```
-
-Each tick prints the incoming event and the full current window:
-
-```
-Stream engine started: count-based window (last 2 point(s))
-Simulating 3 event(s).
-
-Incoming: 10:18:03.797 AMZN   BUY  $144.18     qty=39
-Current window (1 point(s)):
-  10:18:03.797 AMZN   BUY  $144.18     qty=39
-
-...
-
-Shutting down. Processed 3 event(s).
-```
-
-### Run with a filter
-
-Only trades that match the filter enter the window. Every other trade is
-skipped, so it never takes up window space and never evicts anything.
-
-```bash
-java -cp out com.tsdb.FilterDemo "<filter>" <count|time> <size> [intervalMs] [numEvents] [seed]
-```
-
-- `"<filter>"`: which trades to keep, in quotes (syntax below). Use `""`
-  for no filter.
-- `count <N>` / `time <seconds>`: window type and size, same as above.
-- `intervalMs`: real delay between simulated events, in ms (default `400`).
-- `numEvents`: number of events to simulate. `0` or omitted runs forever
-  (Ctrl+C to stop).
-- `seed`: optional random seed. The same seed produces the same sequence
-  of symbols, sides, prices, and quantities every run. Timestamps still
-  start at the current time, so they differ between runs.
-
-Examples:
-```bash
-java -cp out com.tsdb.FilterDemo "symbol=AAPL" count 5                           # only AAPL trades, last 5
-java -cp out com.tsdb.FilterDemo "symbol=AAPL AND price>200" time 10             # AAPL over $200, last 10s
-java -cp out com.tsdb.FilterDemo "symbol=AAPL OR symbol=NVDA" count 5 300 30 42  # 30 events, repeatable
-```
-
-**Filter syntax**
+**Condition syntax**
 
 | Part | Options |
 |---|---|
-| Fields | `symbol`, `side`, `price`, `quantity` (or `qty`) |
-| Operators | `=` (or `==`) `!=` `>` `<` `>=` `<=`. The text fields `symbol` and `side` only allow `=` and `!=` |
-| Combine | `AND`, `OR`. AND binds tighter than OR, like SQL. No parentheses. |
-| Values | Case-insensitive; quotes are optional (`symbol='AAPL'`); no spaces inside a value; `side` must be `BUY` or `SELL`; numbers must be finite |
+| Fields | `ticker` (or `symbol`), `side`, `price`, `qty` (or `quantity`) |
+| Operators | `=` (or `==`) `!=` `>` `<` `>=` `<=`. `ticker` and `side` only allow `=` and `!=` |
+| Combine | `AND`, `OR`. AND binds tighter than OR. No parentheses. |
+| Values | Case-insensitive; quotes are optional (`ticker = 'AAPL'`); no spaces inside a value; tickers are `AAPL`, `MSFT`, `GOOG`, `NVDA`, `AMZN`, `TSLA`; `side` is `BUY` or `SELL`; numbers must be finite |
 
-The run first prints the window, the filter, and the equivalent SQL. It
-then marks each event `PASS` (entered the window, followed by the
-window's contents) or `skip` (filtered out), and ends with a summary:
+**How queries work.** A query is a standing filter plus its aggregators,
+running in the "query" engine, so the aggregates update incrementally
+(`onInsert` / `onEvict`) as trades enter and leave its window. `FILTER`
+builds the query from the "all" engine's window, so it always starts from
+everything, no matter what the previous query was. `ALSO FILTER` and
+`AGGREGATE` build it from the current query's trades. Trades the filter
+rejects never enter the query's window and never evict anything, so with a
+`count` window the query holds the last `<size>` *matching* trades, and
+with a `time` window its trades only age out when a newer matching trade
+arrives. A live aggregate line starts with the time of the newest trade in
+the query's window, and nothing prints while the values stay the same.
+
+Commands and keywords are case-insensitive. A misspelled ticker
+(`FILTER ticker = APPL`) is an error instead of silently emptying the
+query, and a command with a mistake typed while watching prints the error
+and keeps watching. When the generator finishes its `events`, the prompt
+comes back by itself. An empty window gives `NaN` for sum/average/min/max
+and `0` for count.
+
+The generator's simulated clock starts at the current time and moves
+forward by a random amount between `interval/2` and `2*interval` per
+trade, so trade timestamps advance at roughly real-time speed. Time
+windows always use these trade timestamps, not the wall clock.
+
+Example session. Lines marked `<-` are what was typed; the rest is output:
 
 ```
-Window : count-based window (last 2 point(s))
-Filter : symbol=AAPL OR symbol=NVDA
-SQL    : SELECT * FROM trades WHERE symbol = 'AAPL' OR symbol = 'NVDA'
+tsdb> GENERATE DATA window=count size=5 interval=60
+Generating trades into a count-based window (last 5 point(s)), about one every 60 ms until STOP DATA. WINDOW shows it.
 
-  PASS  10:18:03.970 AAPL   SELL $377.17     qty=33
-        window now holds 1 point(s):
-          10:18:03.970 AAPL   SELL $377.17     qty=33
-  skip  10:18:03.986 TSLA   SELL $457.36     qty=227
+tsdb> WINDOW
+Watching every trade in a count-based window (last 5 point(s)). Press Enter to stop.
+Window (5 trade(s)):
+  12:49:11.728 GOOG   BUY  $202.75     qty=249
+  12:49:11.834 AAPL   BUY  $88.77      qty=259
+  12:49:11.927 GOOG   BUY  $203.05     qty=347
+  12:49:12.011 MSFT   SELL $87.49      qty=488
+  12:49:12.058 AAPL   BUY  $88.71      qty=93
+
+Incoming: 12:49:12.092 GOOG   SELL $202.06     qty=136
+Window (5 trade(s)):
+  12:49:11.834 AAPL   BUY  $88.77      qty=259
   ...
+                                                   <- Enter
+Stopped watching. The generator keeps running; STOP DATA stops it.
 
-Processed 5, passed 1, filtered out 4.
+tsdb> AGGREGATE AVERAGE, MAX qty, COUNT
+Watching AVERAGE price, MAX quantity, COUNT of every trade in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
+  12:49:12.137  AVERAGE price = 156.79   MAX quantity = 488   COUNT = 5
+  12:49:12.240  AVERAGE price = 184.11   MAX quantity = 488   COUNT = 5
+  12:49:12.356  AVERAGE price = 184.50   MAX quantity = 486   COUNT = 5
+                                                   <- Enter
+Stopped watching. The generator keeps running; STOP DATA stops it.
+
+tsdb> AGGREGATE AVERAGE, COUNT GROUP BY symbol
+Watching AVERAGE price GROUP BY symbol, COUNT GROUP BY symbol of every trade in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
+  12:49:12.484
+      AVERAGE price GROUP BY symbol: AAPL 89.40   GOOG 202.22   MSFT 88.32   TSLA 339.68
+      COUNT GROUP BY symbol: AAPL 1   GOOG 2   MSFT 1   TSLA 1
+  12:49:12.549
+      AVERAGE price GROUP BY symbol: AAPL 89.25   GOOG 201.80   MSFT 88.32   TSLA 339.68
+      COUNT GROUP BY symbol: AAPL 2   GOOG 1   MSFT 1   TSLA 1
+                                                   <- Enter
+Stopped watching. The generator keeps running; STOP DATA stops it.
+
+tsdb> FILTER ticker = nvda or ticker = tsla
+New query symbol=NVDA OR symbol=TSLA: 0 of the 5 trade(s) in the window match.
+
+tsdb> ALSO FILTER side = buy AGGREGATE AVERAGE, COUNT
+Query narrowed to (symbol=NVDA OR symbol=TSLA) AND side=BUY: 0 of 0 trade(s) still match.
+Watching AVERAGE price, COUNT of (symbol=NVDA OR symbol=TSLA) AND side=BUY in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
+  (empty)       AVERAGE price = NaN   COUNT = 0
+  12:49:12.882  AVERAGE price = 338.75   COUNT = 1
+ALSO FILTER price < 1000                           <- typed while watching; keeps the aggregates
+Query narrowed to (symbol=NVDA OR symbol=TSLA) AND side=BUY AND price<1000: 1 of 1 trade(s) still match.
+Watching AVERAGE price, COUNT of (symbol=NVDA OR symbol=TSLA) AND side=BUY AND price<1000 in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
+  12:49:12.882  AVERAGE price = 338.75   COUNT = 1
+                                                   <- Enter
+Stopped watching. The generator keeps running; STOP DATA stops it.
+
+tsdb> STOP DATA
+Stopped the generator after 36 trade(s). The window can still be queried; GENERATE DATA starts over.
+
+tsdb> AGGREGATE MAX qty GROUP BY ticker
+Showing MAX quantity GROUP BY symbol of (symbol=NVDA OR symbol=TSLA) AND side=BUY AND price<1000 in a count-based window (last 5 point(s)). The generator is stopped, so this won't change.
+  12:49:12.882
+      MAX quantity GROUP BY symbol: TSLA 5
 ```
-
-An invalid filter prints an error and exits with status 1. For example,
-`"price>abc"` prints `Bad filter: price must be compared to a number, got 'abc'`.
-
-### Run with aggregates
-
-Same arguments as the filter demo, with the aggregate list in front. After
-each accepted event the current value of every aggregate is printed.
-
-```bash
-java -cp out com.tsdb.AggregateDemo "<aggregates>" "<filter>" <count|time> <size> [intervalMs] [numEvents] [seed]
-```
-
-- `"<aggregates>"` — comma-separated list of `count`, `sum(f)`, `avg(f)`,
-  `min(f)`, `max(f)` with `f` = `price` or `quantity` (or `qty`), optionally
-  followed by `GROUP BY symbol` or `GROUP BY side`.
-- `"<filter>"` — same syntax as above, or `""` for no filter.
-
-Examples:
-```bash
-java -cp out com.tsdb.AggregateDemo "avg(price), max(price), count" "" count 5          # last 5 trades
-java -cp out com.tsdb.AggregateDemo "min(price), max(price)" "symbol=AAPL" time 10     # AAPL price range, last 10s
-java -cp out com.tsdb.AggregateDemo "avg(price), count GROUP BY symbol" "side=BUY" count 20 50 40 42
-```
-
-The run starts by printing the equivalent SQL, e.g.:
-
-```
-SQL    : SELECT symbol, AVG(price), COUNT(*) FROM trades WHERE side = 'BUY' GROUP BY symbol
-```
-
-and each accepted event prints the window size and the aggregates:
-
-```
-  PASS  23:54:25.150 TSLA   BUY  $456.94     qty=95
-        window holds 4 point(s)
-        AVG(price) GROUP BY symbol:
-          AMZN   350.09
-          GOOG   189.46
-          TSLA   457.62
-        COUNT(*) GROUP BY symbol:
-          AMZN   1
-          GOOG   1
-          TSLA   2
-```
-
-An empty window gives `NaN` for sum/avg/min/max and `0` for count.
 
 ### Tests
 
@@ -291,8 +297,8 @@ fails:
 ```bash
 java -cp out com.tsdb.WindowTest           # window eviction            -> ALL TESTS PASSED
 java -cp out com.tsdb.EngineContractTest   # filter -> window -> aggregators contract -> ALL CONTRACT TESTS PASSED
-java -cp out com.tsdb.FilterTest           # operators, AND/OR, bad input -> ALL 64 FILTER TESTS PASSED
-java -cp out com.tsdb.AggregatorTest       # aggregates vs brute force, group by, parser -> ALL 50 AGGREGATOR TESTS PASSED
+java -cp out com.tsdb.FilterTest           # operators, AND/OR, bad input -> ALL 66 FILTER TESTS PASSED
+java -cp out com.tsdb.AggregatorTest       # aggregates vs brute force, group by, shell aggregate syntax -> ALL 51 AGGREGATOR TESTS PASSED
 ```
 
 ## Roadmap
@@ -305,7 +311,7 @@ VERSION 2  ✅ done
   Filtering (e.g. symbol = AAPL, price > 200)
 
 VERSION 3  ✅ done
-  Aggregations over a window (count, sum, avg, min, max, group by), maintained incrementally
+  Aggregations over a window (count, sum, average, min, max, group by), maintained incrementally
 
 VERSION 4  ✅ done
   Compound filter conditions (AND/OR)

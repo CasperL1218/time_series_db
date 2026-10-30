@@ -73,7 +73,7 @@ public class EngineContractTest {
             public void onInsert(DataPoint p) { s += p.getPrice(); n++; }
             public void onEvict(DataPoint p)  { s -= p.getPrice(); n--; }
             public double result() { return n == 0 ? Double.NaN : s; }
-            public String describe() { return "SUM(price)"; }
+            public String describe() { return "SUM price"; }
         };
         for (Window w : List.of(new CountWindow(5), new TimeWindow(3000))) {
             StreamEngine e = new StreamEngine(w, Filter.ACCEPT_ALL, List.of(sum));

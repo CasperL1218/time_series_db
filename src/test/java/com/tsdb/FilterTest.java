@@ -5,7 +5,7 @@ import java.util.Objects;
 
 /**
  * Tests for the filtering layer: operators, boundaries, parser formatting,
- * AND/OR precedence, describe()/toSql(), engine integration, and bad input.
+ * AND/OR precedence, describe(), engine integration, and bad input.
  *
  * Helpers: expect() parses a filter and tests it against one trade; bad()
  * asserts that parsing throws; check() covers everything else.
@@ -33,7 +33,7 @@ public class FilterTest {
         testOr();
         testPrecedence();
         testBlankIsAcceptAll();
-        testDescribeAndSql();
+        testDescribe();
         testEngineSkipsFilteredPoints();
         testBadInput();
 
@@ -115,11 +115,17 @@ public class FilterTest {
         check("ACCEPT_ALL passes everything", Filter.ACCEPT_ALL.test(MSFT_SELL_320_500), true);
     }
 
-    private static void testDescribeAndSql() {
+    private static void testDescribe() {
         Filter f = FilterParser.parse("symbol=AAPL AND price>200 OR side!=buy");
         check("describe() shows AND grouping", f.describe(), "(symbol=AAPL AND price>200) OR side!=BUY");
-        check("toSql()", FilterParser.toSql(f), "(symbol = 'AAPL' AND price > 200) OR side <> 'BUY'");
-        check("toSql(ACCEPT_ALL)", FilterParser.toSql(Filter.ACCEPT_ALL), "TRUE");
+        check("ticker is another name for symbol", FilterParser.parse("ticker = nvda").describe(), "symbol=NVDA");
+
+        Filter andOfOr = new AndFilter(List.of(FilterParser.parse("symbol=AAPL OR symbol=NVDA"), FilterParser.parse("price<200")));
+        check("describe() wraps OR inside AND", andOfOr.describe(), "(symbol=AAPL OR symbol=NVDA) AND price<200");
+
+        // Whole numbers too big for a long used to print as Long.MAX_VALUE.
+        check("describe() of a huge whole number", FilterParser.parse("price<1e300").describe(), "price<1.0E300");
+        check("describe() of a big but exact whole number", FilterParser.parse("qty<123456789012").describe(), "quantity<123456789012");
     }
 
     private static void testEngineSkipsFilteredPoints() {

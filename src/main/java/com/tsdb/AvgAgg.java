@@ -13,5 +13,5 @@ public final class AvgAgg extends FieldAggregator {
 
     @Override public double result() { return n == 0 ? Double.NaN : sum / n; }
 
-    @Override protected String name() { return "AVG"; }
+    @Override protected String name() { return "AVERAGE"; }
 }

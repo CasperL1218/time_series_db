@@ -7,8 +7,8 @@ package com.tsdb;
  * then onEvict() for every point that insert pushed out, so result()
  * always reflects exactly window.contents() -- without rescanning it.
  *
- * No implementations exist yet. Planned (owner: Person 2): CountAgg, SumAgg,
- * AvgAgg, MinAgg, MaxAgg, GroupByAggregator.
+ * Implementations: CountAgg, SumAgg, AvgAgg, MinAgg, MaxAgg and
+ * GroupByAggregator, built by the Shell's aggregate commands.
  */
 public interface Aggregator {
 
@@ -21,6 +21,6 @@ public interface Aggregator {
     /** Current value over the window; Double.NaN if the window is empty. */
     double result();
 
-    /** Display label, e.g. "AVG(price)". */
+    /** Display label, e.g. "AVERAGE price". */
     String describe();
 }

@@ -7,7 +7,7 @@ import java.util.function.Supplier;
 
 /**
  * Runs one inner aggregator per distinct value of a text field (symbol or
- * side), like SQL {@code SELECT AVG(price) ... GROUP BY symbol}.
+ * side), e.g. the shell's {@code AVERAGE GROUP BY symbol}.
  *
  * Groups appear when their first point enters the window and disappear when
  * their last point is evicted, so {@link #results()} lists exactly the groups
@@ -88,7 +88,4 @@ public final class GroupByAggregator implements Aggregator {
     public String describe() {
         return innerLabel + " GROUP BY " + groupField.label();
     }
-
-    public FieldFilter.Field getGroupField() { return groupField; }
-    public String getInnerLabel() { return innerLabel; }
 }

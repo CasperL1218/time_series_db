@@ -24,21 +24,14 @@ public final class AndFilter implements Filter {
         return true;
     }
 
+    /** OR groups are wrapped in (), since AND binds tighter; the parser never builds these, but Shell's ALSO FILTER does. */
     @Override
     public String describe() {
-        return join(" AND ", false);
-    }
-
-    /** SQL-style form, like "symbol = 'AAPL' AND price > 200". */
-    public String toSql() {
-        return join(" AND ", true);
-    }
-
-    private String join(String sep, boolean sql) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < children.size(); i++) {
-            if (i > 0) sb.append(sep);
-            sb.append(FilterParser.render(children.get(i), sql));
+            if (i > 0) sb.append(" AND ");
+            Filter c = children.get(i);
+            sb.append(c instanceof OrFilter ? "(" + c.describe() + ")" : c.describe());
         }
         return sb.toString();
     }

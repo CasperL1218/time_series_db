@@ -1,5 +1,6 @@
 package com.tsdb;
 
+import java.util.List;
 import java.util.Random;
 
 /**
@@ -14,7 +15,8 @@ import java.util.Random;
  */
 public class FinancialDataGenerator {
 
-    private static final String[] SYMBOLS = {"AAPL", "MSFT", "GOOG", "NVDA", "AMZN", "TSLA"};
+    /** Every symbol the generator trades. */
+    public static final List<String> SYMBOLS = List.of("AAPL", "MSFT", "GOOG", "NVDA", "AMZN", "TSLA");
 
     private final Random random;
     private final double[] lastPrice;
@@ -34,16 +36,16 @@ public class FinancialDataGenerator {
         this.clockMillis = startMillis;
         this.minDeltaMillis = minDeltaMillis;
         this.maxDeltaMillis = maxDeltaMillis;
-        this.lastPrice = new double[SYMBOLS.length];
-        for (int i = 0; i < SYMBOLS.length; i++) {
+        this.lastPrice = new double[SYMBOLS.size()];
+        for (int i = 0; i < SYMBOLS.size(); i++) {
             lastPrice[i] = 50 + random.nextDouble() * 450; // seed price in [$50, $500)
         }
     }
 
     /** Produces the next synthetic event and advances the simulated clock. */
     public DataPoint next() {
-        int idx = random.nextInt(SYMBOLS.length);
-        String symbol = SYMBOLS[idx];
+        int idx = random.nextInt(SYMBOLS.size());
+        String symbol = SYMBOLS.get(idx);
 
         double drift = (random.nextDouble() - 0.5) * 2.0; // +/- $1.00 random walk per tick
         lastPrice[idx] = Math.max(1.0, lastPrice[idx] + drift);

@@ -24,26 +24,15 @@ public final class OrFilter implements Filter {
         return false;
     }
 
+    /** AND groups are wrapped in () for clarity, even though AND already binds tighter. */
     @Override
     public String describe() {
-        return join(false);
-    }
-
-    /** SQL-style form; AND groups are wrapped in () for clarity, even though AND already binds tighter. */
-    public String toSql() {
-        return join(true);
-    }
-
-    private String join(boolean sql) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < children.size(); i++) {
             if (i > 0) sb.append(" OR ");
             Filter c = children.get(i);
-            String s = FilterParser.render(c, sql);
-            sb.append(c instanceof AndFilter ? "(" + s + ")" : s);
+            sb.append(c instanceof AndFilter ? "(" + c.describe() + ")" : c.describe());
         }
         return sb.toString();
     }
-
-    public List<Filter> getChildren() { return children; }
 }

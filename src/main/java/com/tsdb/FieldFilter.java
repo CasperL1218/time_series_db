@@ -7,7 +7,7 @@ import java.util.Locale;
  * e.g. {@code symbol=AAPL}, {@code side!=SELL}, {@code price>200},
  * {@code quantity<=100}.
  *
- * Text fields (symbol, side) support only = and !=.
+ * Text fields (symbol, also called ticker, and side) support only = and !=.
  * Numeric fields (price, quantity) support = != > < >= <=.
  *
  * Text values are normalized to upper case and compared case-insensitively;
@@ -21,17 +21,18 @@ public final class FieldFilter implements Filter {
         final boolean numeric;
         Field(boolean numeric) { this.numeric = numeric; }
 
-        /** Accepts "symbol", "side", "price", "quantity" or "qty". */
+        /** Accepts "symbol" (or "ticker"), "side", "price", "quantity" or "qty". */
         public static Field fromName(String name) {
             switch (name.trim().toLowerCase(Locale.ROOT)) {
-                case "symbol":   return SYMBOL;
+                case "symbol":
+                case "ticker":   return SYMBOL;
                 case "side":     return SIDE;
                 case "price":    return PRICE;
                 case "quantity":
                 case "qty":      return QUANTITY;
                 default:
                     throw new IllegalArgumentException("Unknown field '" + name
-                            + "'. Expected one of: symbol, side, price, quantity");
+                            + "'. Expected one of: symbol (or ticker), side, price, quantity");
             }
         }
 
@@ -129,18 +130,13 @@ public final class FieldFilter implements Filter {
         return field.label() + op.symbol + valueText();
     }
 
-    /** SQL-style form, e.g. "symbol = 'AAPL'" or "price > 200". */
-    public String toSql() {
-        String v = field.numeric ? valueText() : "'" + textValue + "'";
-        return field.label() + " " + (op == Op.NE ? "<>" : op.symbol) + " " + v;
-    }
-
-    /** Value as text; whole numbers print without a trailing ".0" (200, not 200.0). */
+    /**
+     * Value as text; whole numbers print without a trailing ".0" (200, not 200.0).
+     * The 1e15 cap keeps the long cast exact, so 1e300 doesn't print as Long.MAX_VALUE.
+     */
     private String valueText() {
         if (!field.numeric) return textValue;
-        return numValue == Math.rint(numValue) ? String.valueOf((long) numValue) : String.valueOf(numValue);
+        return numValue == Math.rint(numValue) && Math.abs(numValue) < 1e15
+                ? String.valueOf((long) numValue) : String.valueOf(numValue);
     }
-
-    public Field getField() { return field; }
-    public Op getOp() { return op; }
 }

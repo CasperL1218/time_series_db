@@ -3,7 +3,7 @@ package com.tsdb;
 /**
  * Base for aggregators over one numeric field (price or quantity) of each
  * {@link DataPoint}. Subclasses maintain their running state; this class
- * owns the field choice, the value lookup and the "NAME(field)" label.
+ * owns the field choice, the value lookup and the "NAME field" label.
  */
 abstract class FieldAggregator implements Aggregator {
 
@@ -17,7 +17,7 @@ abstract class FieldAggregator implements Aggregator {
         this.field = field;
     }
 
-    /** The aggregate's SQL-style name, e.g. "AVG". */
+    /** The aggregate's name, as typed in the shell, e.g. "AVERAGE". */
     protected abstract String name();
 
     /** The numeric value of this aggregator's field for the given point. */
@@ -31,8 +31,6 @@ abstract class FieldAggregator implements Aggregator {
 
     @Override
     public String describe() {
-        return name() + "(" + field.label() + ")";
+        return name() + " " + field.label();
     }
-
-    public FieldFilter.Field getField() { return field; }
 }

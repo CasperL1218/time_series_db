@@ -14,7 +14,7 @@ import java.util.function.Consumer;
  *  - The {@link Window} owns the eviction policy and reports what it evicted.
  *  - Each {@link Aggregator} is told about the insert and every eviction, so
  *    its result stays in sync with the window without rescanning it.
- *  - The listener (e.g. the CLI display) is notified only when an event was
+ *  - The listener (e.g. the shell's live view) is notified only when an event was
  *    accepted, since otherwise nothing changed.
  */
 public class StreamEngine {
@@ -27,7 +27,7 @@ public class StreamEngine {
     private long pointsProcessed = 0; // every event received
     private long pointsFiltered = 0;  // events rejected by the filter
 
-    /** Window only: no filter, no aggregators (Version 1 behaviour). */
+    /** Window only: no filter, no aggregators. */
     public StreamEngine(Window window) {
         this(window, Filter.ACCEPT_ALL, Collections.emptyList());
     }

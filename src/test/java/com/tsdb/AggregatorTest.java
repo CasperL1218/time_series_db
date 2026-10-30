@@ -6,9 +6,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.function.Supplier;
 
 /**
- * Tests for the aggregation layer.
+ * Tests for the aggregation layer and the shell's aggregate syntax.
  *
  * The core property: after every event, each aggregator's running result
  * equals a brute-force recompute over window.contents(). Checked by hand on
@@ -34,7 +35,6 @@ public class AggregatorTest {
         testGroupByMatchesBruteForce();
         testParser();
         testParserBadInput();
-        testSql();
 
         System.out.println();
         if (failures == 0) {
@@ -64,12 +64,12 @@ public class AggregatorTest {
         e.processUpdate(dp(2, "A", 20, 200));
         check("hand: count after 2", count.result(), 2.0);
         check("hand: sum after 2", sum.result(), 30.0);
-        check("hand: avg(qty) after 2", avg.result(), 150.0);
+        check("hand: average qty after 2", avg.result(), 150.0);
         e.processUpdate(dp(3, "A", 30, 300));
         e.processUpdate(dp(4, "A", 40, 400)); // evicts the 10/100 point
         check("hand: count stays at capacity", count.result(), 3.0);
         check("hand: sum drops evicted", sum.result(), 90.0);
-        check("hand: avg(qty) drops evicted", avg.result(), 300.0);
+        check("hand: average qty drops evicted", avg.result(), 300.0);
     }
 
     private static void testMinMaxByHand() {
@@ -145,7 +145,7 @@ public class AggregatorTest {
         check("groupby: evicted point leaves its group", g.results(), Map.of("AAPL", 20.0, "NVDA", 100.0, "MSFT", 7.0));
         e.processUpdate(dp(5, "MSFT", 9, 1)); // evicts NVDA@100, last of its group
         check("groupby: empty group disappears", g.results(), Map.of("AAPL", 20.0, "MSFT", 8.0));
-        check("groupby: describe", g.describe(), "AVG(price) GROUP BY symbol");
+        check("groupby: describe", g.describe(), "AVERAGE price GROUP BY symbol");
         boolean threw = false;
         try { g.result(); } catch (UnsupportedOperationException ex) { threw = true; }
         check("groupby: result() refuses, use results()", threw, true);
@@ -172,47 +172,56 @@ public class AggregatorTest {
         check("groupby: random stream matches brute force", firstMismatch, null);
     }
 
+    /** The shell's aggregate syntax, e.g. "AVERAGE, MAX qty, COUNT GROUP BY symbol". */
     private static void testParser() {
-        List<Aggregator> aggs = AggregatorParser.parse(" Avg( price ) , max(qty), COUNT, count(*) ");
-        check("parser: four aggregates", describeAll(aggs), List.of("AVG(price)", "MAX(quantity)", "COUNT(*)", "COUNT(*)"));
+        List<Aggregator> aggs = build(" average , max qty, COUNT, avg quantity ");
+        check("parser: four aggregates", describeAll(aggs),
+                List.of("AVERAGE price", "MAX quantity", "COUNT", "AVERAGE quantity"));
         check("parser: types", aggs.get(0) instanceof AvgAgg && aggs.get(1) instanceof MaxAgg
                 && aggs.get(2) instanceof CountAgg, true);
-        check("parser: sum and min", describeAll(AggregatorParser.parse("sum(quantity), min(price)")),
-                List.of("SUM(quantity)", "MIN(price)"));
-        List<Aggregator> grouped = AggregatorParser.parse("avg(price), count group by Symbol");
-        check("parser: group by wraps each aggregate", describeAll(grouped),
-                List.of("AVG(price) GROUP BY symbol", "COUNT(*) GROUP BY symbol"));
-        check("parser: group by side", describeAll(AggregatorParser.parse("max(qty) GROUP BY side")),
-                List.of("MAX(quantity) GROUP BY side"));
+        check("parser: sum and min", describeAll(build("SUM quantity, MIN")), List.of("SUM quantity", "MIN price"));
+        check("parser: group by wraps each aggregate", describeAll(build("average, count group by Symbol")),
+                List.of("AVERAGE price GROUP BY symbol", "COUNT GROUP BY symbol"));
+        check("parser: group by ticker means symbol", describeAll(build("MAX qty GROUP BY ticker")),
+                List.of("MAX quantity GROUP BY symbol"));
+        check("parser: group by side", describeAll(build("max qty GROUP BY side")),
+                List.of("MAX quantity GROUP BY side"));
+        Supplier<Aggregator> count = Shell.parseAggregates("COUNT").get(0);
+        check("parser: each use gets a fresh aggregator", count.get() != count.get(), true);
     }
 
     private static void testParserBadInput() {
-        expectBad("", "empty");
-        expectBad("median(price)", "unknown function");
-        expectBad("avg", "missing field");
-        expectBad("avg()", "empty parens");
-        expectBad("avg(symbol)", "text field in numeric aggregate");
-        expectBad("avg(volume)", "unknown field");
-        expectBad("count(price)", "count with field");
-        expectBad("avg(price),", "trailing comma");
-        expectBad("avg(price) group by price", "group by numeric field");
-        expectBad("avg(price) group by sector", "group by unknown field");
-        expectBad("avg(price) max(price)", "missing comma");
-    }
+        expectBad("MEDIAN", "unknown aggregate");
+        expectBad("AVERAGE symbol", "text field in numeric aggregate");
+        expectBad("AVERAGE volume", "unknown field");
+        expectBad("COUNT price", "count with field");
+        expectBad("AVERAGE,", "trailing comma");
+        expectBad("AVERAGE MAX", "missing comma");
+        expectBad("avg(price)", "old function-call syntax");
+        expectBad("AVERAGE GROUP BY price", "group by numeric field");
+        expectBad("AVERAGE GROUP BY sector", "group by unknown field");
+        expectBad("AVERAGE GROUP BY", "group by without a field");
+        expectBad("AVERAGE GROUP BY symbol, COUNT", "group by not last");
 
-    private static void testSql() {
-        Filter f = FilterParser.parse("symbol=AAPL AND price>200");
-        check("sql: plain", AggregatorParser.toSql(AggregatorParser.parse("avg(price), count"), f),
-                "SELECT AVG(price), COUNT(*) FROM trades WHERE symbol = 'AAPL' AND price > 200");
-        check("sql: no filter", AggregatorParser.toSql(AggregatorParser.parse("min(qty)"), Filter.ACCEPT_ALL),
-                "SELECT MIN(quantity) FROM trades");
-        check("sql: group by", AggregatorParser.toSql(AggregatorParser.parse("max(price) group by symbol"), f),
-                "SELECT symbol, MAX(price) FROM trades WHERE symbol = 'AAPL' AND price > 200 GROUP BY symbol");
+        for (String name : List.of("FOO", "MEDIAN")) {
+            try {
+                Shell.parseAggregates(name);
+                check("'" + name + "' is rejected", false, true);
+            } catch (IllegalArgumentException e) {
+                check("'" + name + "' reads as an unknown aggregate", e.getMessage().startsWith("Unknown aggregate"), true);
+            }
+        }
     }
 
     // --- helpers ---
     private static DataPoint dp(long ts, String sym, double price, int qty) {
         return new DataPoint(ts, sym, price, qty, DataPoint.Side.BUY);
+    }
+
+    private static List<Aggregator> build(String text) {
+        List<Aggregator> out = new ArrayList<>();
+        for (Supplier<Aggregator> s : Shell.parseAggregates(text)) out.add(s.get());
+        return out;
     }
 
     private static List<String> describeAll(List<Aggregator> aggs) {
@@ -223,7 +232,7 @@ public class AggregatorTest {
 
     private static void expectBad(String text, String why) {
         try {
-            AggregatorParser.parse(text);
+            Shell.parseAggregates(text);
             failures++;
             System.out.println("  FAIL bad input accepted (" + why + "): \"" + text + "\"");
         } catch (IllegalArgumentException e) {

@@ -11,5 +11,5 @@ public final class CountAgg implements Aggregator {
     /** Returns 0 (not NaN) for an empty window, since a count of nothing is a real number. */
     @Override public double result() { return n; }
 
-    @Override public String describe() { return "COUNT(*)"; }
+    @Override public String describe() { return "COUNT"; }
 }

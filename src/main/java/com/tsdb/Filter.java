@@ -5,7 +5,6 @@ package com.tsdb;
  * window, so rejected events never occupy window space or reach aggregators.
  *
  * Implementations: FieldFilter, AndFilter, OrFilter (built by FilterParser).
- * Owner: Person 1.
  */
 public interface Filter {
 

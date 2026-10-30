@@ -13,11 +13,11 @@ import java.util.regex.Pattern;
  *   expr      := andGroup ( OR andGroup )*
  *   andGroup  := condition ( AND condition )*
  *   condition := field op value
- *   field     := symbol | side | price | quantity | qty
+ *   field     := symbol | ticker | side | price | quantity | qty
  *   op        := = | == | != | > | < | >= | <=
  *   value     := a single token, optionally quoted (no spaces or = < > !)
  * </pre>
- * AND binds tighter than OR, like SQL:
+ * AND binds tighter than OR:
  * {@code symbol=AAPL AND price>200 OR symbol=NVDA} means
  * {@code (symbol=AAPL AND price>200) OR symbol=NVDA}.
  *
@@ -59,7 +59,7 @@ public final class FilterParser {
     }
 
     /** Parses one comparison such as "price>=200" or "symbol = 'AAPL'". */
-    static FieldFilter parseCondition(String cond) {
+    private static FieldFilter parseCondition(String cond) {
         if (cond == null || cond.trim().isEmpty()) {
             throw new IllegalArgumentException("Empty condition (check for doubled AND/OR)");
         }
@@ -94,21 +94,6 @@ public final class FilterParser {
             return FieldFilter.numeric(field, op, v);
         }
         return FieldFilter.text(field, op, raw);
-    }
-
-    /** SQL WHERE-clause form of any filter, e.g. for the display header or slides. */
-    public static String toSql(Filter f) {
-        if (f == Filter.ACCEPT_ALL) return "TRUE";
-        return render(f, true);
-    }
-
-    /** describe() form, or SQL form when {@code sql} is true; used by AndFilter/OrFilter to render children. */
-    static String render(Filter f, boolean sql) {
-        if (!sql) return f.describe();
-        if (f instanceof FieldFilter) return ((FieldFilter) f).toSql();
-        if (f instanceof AndFilter)   return ((AndFilter) f).toSql();
-        if (f instanceof OrFilter)    return ((OrFilter) f).toSql();
-        return f.describe();
     }
 
     /** The split patterns need whitespace on both sides, so a leading/trailing AND/OR must be caught here. */
