@@ -1,8 +1,17 @@
 package com.tsdb;
 
+import com.tsdb.storage.DiskStore;
+import com.tsdb.storage.RecordCursor;
+import com.tsdb.storage.StoreStats;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -10,6 +19,7 @@ import java.util.Map;
 import java.util.Locale;
 import java.util.Set;
 import java.util.StringJoiner;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
@@ -40,6 +50,10 @@ import java.util.regex.Pattern;
  *   WINDOW;               watch the current query live
  *   (Enter)               stop watching; the generator keeps running
  *   STOP DATA;            stop the generator; the window can still be queried
+ *   WAIT DATA;            wait for a run with an events= limit to finish (for scripted input)
+ *   STORAGE;              the disk store's record and segment counts
+ *   DUMP [FIRST n | LAST n];
+ *                         print stored trades with their sequence numbers (default LAST 10)
  *   HELP;  EXIT
  * </pre>
  * The condition uses the FilterParser syntax (ticker = AAPL, price < 200,
@@ -49,11 +63,18 @@ import java.util.regex.Pattern;
  * keeps every trade, the other runs the current query, i.e. its filter and
  * its aggregators, which update incrementally as trades arrive and leave.
  * SELECT rebuilds the query from the first engine, so it sees the whole
- * window; ALSO rebuilds it from the query's own contents. Nothing is written
- * to disk.
+ * window; ALSO rebuilds it from the query's own contents.
+ *
+ * Before the engines see a trade, it is appended to a DiskStore in the data
+ * directory, so every trade ever generated survives a restart, not just the
+ * window's. The append happens outside the lock, since it may fsync. The
+ * engines don't read the store; STORAGE and DUMP do. A new run's clock
+ * starts no earlier than the newest stored trade, so the log stays in time
+ * order across runs. The generator is stopped with a flag, never an
+ * interrupt: an interrupt would close the store's files (see DiskStore).
  *
  * Usage:
- *   java -cp out com.tsdb.Shell
+ *   java -cp out com.tsdb.Shell [--data-dir &lt;path&gt;]     (default: data)
  */
 public class Shell {
 
@@ -71,6 +92,12 @@ public class Shell {
             "^\\s*(?:symbol|ticker)\\s*(?:==|!=|=)\\s*['\"]?([A-Za-z]+)['\"]?\\s*$", Pattern.CASE_INSENSITIVE);
     private static final Pattern AGGREGATE = Pattern.compile("^\\s*([A-Za-z]+)(?:\\s+([A-Za-z]+))?\\s*$");
     private static final Pattern GROUP_BY = Pattern.compile("\\s+GROUP\\s+BY(?:\\s+|$)", Pattern.CASE_INSENSITIVE);
+    private static final String DUMP_USAGE = "Usage: DUMP [FIRST <n> | LAST <n>];";
+    private static final DateTimeFormatter DUMP_TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS");
+
+    private final DiskStore store;            // every trade, appended before the engines see it; thread-safe itself
+    private final Object pause = new Object(); // the generator waits on it between trades; stopGenerator notifies it
+    private volatile boolean stopRequested;    // STOP DATA / EXIT: the generator ends after its current trade
 
     // The lock guards every field below except generator: the generator thread feeds trades and
     // prints live updates, the prompt thread swaps queries. Holding it while printing keeps a
@@ -87,6 +114,11 @@ public class Shell {
                                               // it turns false inside the lock, before the thread winds down
     private long generated;
     private Thread generator;
+    private long runEvents;                   // the current run's events= limit, 0 = none; prompt thread only
+
+    private Shell(DiskStore store) {
+        this.store = store;
+    }
 
     /** The clauses of a SELECT or ALSO statement; null where a clause was left out. */
     static final class Clauses {
@@ -96,7 +128,34 @@ public class Shell {
     }
 
     public static void main(String[] args) throws IOException {
-        new Shell().run();
+        Path dataDir = Path.of("data");
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].equals("--data-dir") && i + 1 < args.length) {
+                dataDir = Path.of(args[++i]);
+            } else {
+                System.out.println("Usage: java -cp out com.tsdb.Shell [--data-dir <path>]");
+                System.exit(2);
+            }
+        }
+        DiskStore store;
+        try {
+            store = DiskStore.open(dataDir, DiskStore.Options.defaults());
+        } catch (IOException e) {
+            System.out.println("Can't open storage in " + dataDir + ": " + reason(e));
+            System.exit(1);
+            return;
+        }
+        StoreStats s = store.stats();
+        System.out.println("Storage: " + dataDir + " (" + s.totalRecords() + " record(s) in " + s.segmentCount()
+                + " segment(s)" + (s.recoveredTornBytes() > 0 ? "; recovered " + s.recoveredTornBytes() + " torn byte(s)" : "")
+                + ")");
+        Shell shell = new Shell(store);
+        try {
+            shell.run();
+        } finally { // EXIT, end of input, or an unexpected error
+            shell.stopGenerator();
+            shell.closeStore();
+        }
     }
 
     /** Reads lines until a ; ends a statement, then runs it. A line may also hold several statements. */
@@ -189,6 +248,19 @@ public class Shell {
                 }
                 stopData();
                 return;
+            case "WAIT":
+                if (words.length != 2 || !words[1].equalsIgnoreCase("DATA")) {
+                    throw new IllegalArgumentException("WAIT DATA; waits for the generator to finish its events");
+                }
+                waitData();
+                return;
+            case "STORAGE":
+                noArguments(words);
+                printStorage();
+                return;
+            case "DUMP":
+                dump(words);
+                return;
             case "HELP":
                 noArguments(words);
                 printHelp();
@@ -253,7 +325,8 @@ public class Shell {
         Window window = factory.get();
 
         // Simulated clock advances intervalMs/2 .. 2*intervalMs per event, roughly tracking real time.
-        FinancialDataGenerator source = new FinancialDataGenerator(System.currentTimeMillis(),
+        // It starts no earlier than the newest stored trade, so the store's log never goes back in time.
+        FinancialDataGenerator source = new FinancialDataGenerator(Math.max(System.currentTimeMillis(), store.lastTimestamp()),
                 Math.max(1, intervalMs / 2), Math.max(2, intervalMs * 2));
         synchronized (lock) {
             all = new StreamEngine(window);
@@ -262,6 +335,8 @@ public class Shell {
             generated = 0;
             running = true;
         }
+        stopRequested = false;
+        runEvents = numEvents;
         generator = new Thread(() -> produce(source, intervalMs, numEvents), "generator");
         generator.setDaemon(true); // don't keep the JVM alive after EXIT
         generator.start();
@@ -281,24 +356,40 @@ public class Shell {
         }
     }
 
-    /** Generator thread: feeds each trade to both engines until STOP DATA, EXIT or numEvents. */
+    /**
+     * Generator thread: stores each trade, then feeds it to both engines,
+     * until STOP DATA, EXIT, numEvents or a storage error.
+     */
     private void produce(FinancialDataGenerator source, long intervalMs, long numEvents) {
-        try {
-            for (long i = 0; numEvents == 0 || i < numEvents; i++) {
-                DataPoint dp = source.next();
-                synchronized (lock) {
-                    all.processUpdate(dp);
-                    query.processUpdate(dp); // prints the update if watching
-                    generated++;
+        for (long i = 0; numEvents == 0 || i < numEvents; i++) {
+            DataPoint dp = source.next();
+            try {
+                store.append(dp); // outside the lock: an fsync must not hold up the prompt
+            } catch (IOException | RuntimeException e) {
+                synchronized (lock) { // the engines never see a trade the store refused
+                    running = false;
+                    if (watching) {
+                        query.setOnUpdate(null);
+                        watching = false;
+                    }
+                    System.out.print("\nStorage error: " + reason(e) + ". Generator stopped.\n\ntsdb> ");
+                    System.out.flush();
                 }
-                Thread.sleep(intervalMs);
+                return;
             }
-        } catch (InterruptedException e) {
             synchronized (lock) {
-                running = false;
+                all.processUpdate(dp);
+                query.processUpdate(dp); // prints the update if watching
+                generated++;
             }
-            return; // STOP DATA or EXIT
+            if (!pause(intervalMs)) {
+                synchronized (lock) {
+                    running = false;
+                }
+                return; // STOP DATA or EXIT
+            }
         }
+        syncStore(); // the run is over, so nothing else would trigger the next fsync
         synchronized (lock) {
             running = false;
             if (watching) { // nothing will change any more, so hand the prompt back
@@ -315,18 +406,180 @@ public class Shell {
             throw new IllegalArgumentException("The generator isn't running");
         }
         stopGenerator();
+        syncStore();
         System.out.println("Stopped the generator after " + generated + " trade(s). The window can still be queried;"
                 + " GENERATE DATA starts over.");
     }
 
+    /**
+     * Asks the generator to stop and waits for it. A flag and notify, never
+     * interrupt(): interrupting a thread inside the store's file I/O would
+     * close the store's files. Never called with lock held, since the
+     * generator needs lock to finish its current trade.
+     */
     private void stopGenerator() {
         if (generator == null) return;
-        generator.interrupt();
-        try {
-            generator.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        synchronized (pause) {
+            stopRequested = true;
+            pause.notifyAll();
         }
+        joinGenerator();
+    }
+
+    /**
+     * Waits for the generator thread to end. Nothing interrupts the prompt
+     * thread; if something did, re-setting its interrupt flag would make the
+     * next store call fail, so keep waiting instead.
+     */
+    private void joinGenerator() {
+        while (generator.isAlive()) {
+            try {
+                generator.join();
+            } catch (InterruptedException e) {
+                // see above: deliberately not restored
+            }
+        }
+    }
+
+    /**
+     * Sleeps intervalMs between trades, waking early if stopGenerator asks.
+     * Loops against a deadline because wait() can wake up spuriously.
+     * Returns false if the generator should stop.
+     */
+    private boolean pause(long intervalMs) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(intervalMs);
+        synchronized (pause) {
+            while (!stopRequested) {
+                long left = deadline - System.nanoTime();
+                if (left <= 0) return true;
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(pause, left);
+                } catch (InterruptedException e) {
+                    return false; // nothing interrupts this thread; if something does, stop
+                }
+            }
+            return false;
+        }
+    }
+
+    /** WAIT DATA: blocks until the current run reaches its events= limit. */
+    private void waitData() {
+        if (!isRunning()) {
+            System.out.println("The generator isn't running, so there is nothing to wait for.");
+            return;
+        }
+        if (runEvents == 0) {
+            throw new IllegalArgumentException("This run has no events= limit, so it won't finish on its own;"
+                    + " STOP DATA; stops it");
+        }
+        joinGenerator();
+        System.out.println(generated == runEvents
+                ? "The generator finished after " + generated + " trade(s)."
+                : "The generator stopped early, after " + generated + " of " + runEvents + " trade(s).");
+    }
+
+    // ---- Storage: STORAGE, DUMP ----
+
+    private void printStorage() {
+        StoreStats s;
+        try {
+            s = store.stats();
+        } catch (RuntimeException e) {
+            System.out.println("Storage error: " + reason(e));
+            return;
+        }
+        System.out.println("Storage in " + s.dataDir().toAbsolutePath() + ":");
+        System.out.println("  records:   " + s.totalRecords()
+                + (s.totalRecords() == 0 ? "" : " (seq 0.." + (s.totalRecords() - 1) + ")"));
+        System.out.println("  segments:  " + s.segmentCount() + ", " + s.bytesOnDisk() + " byte(s) on disk");
+        System.out.println("  buffered:  " + s.bufferedRecords() + " record(s) not yet written to the OS");
+        System.out.println("  fsynced:   " + s.syncedRecords() + " record(s)");
+        System.out.println("  newest:    " + (s.totalRecords() == 0 ? "(empty)" : dateTime(s.lastTimestamp())));
+        if (s.recoveredTornBytes() > 0) {
+            System.out.println("  recovered: " + s.recoveredTornBytes() + " torn byte(s) moved aside at startup");
+        }
+    }
+
+    /** DUMP [FIRST n | LAST n]: stored trades with their sequence numbers, oldest first. */
+    private void dump(String[] words) {
+        boolean first = false;
+        long n = 10;
+        if (words.length == 3 && (words[1].equalsIgnoreCase("FIRST") || words[1].equalsIgnoreCase("LAST"))) {
+            first = words[1].equalsIgnoreCase("FIRST");
+            try {
+                n = Long.parseLong(words[2]);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("DUMP needs a whole number of records, got '" + words[2] + "'. " + DUMP_USAGE);
+            }
+            if (n <= 0) throw new IllegalArgumentException("DUMP needs at least 1 record, got " + n);
+        } else if (words.length != 1) {
+            throw new IllegalArgumentException(DUMP_USAGE);
+        }
+        try {
+            long total = store.nextSeq();
+            if (total == 0) {
+                System.out.println("The store is empty.");
+                return;
+            }
+            long from = first ? 0 : Math.max(0, total - n);
+            long to = first ? Math.min(total, n) : total; // exclusive
+            System.out.println("Stored trades " + from + ".." + (to - 1) + " of " + total + ":");
+            try (RecordCursor c = store.scanFromSeq(from)) {
+                while (c.hasNext() && c.nextSeq() < to) {
+                    long seq = c.nextSeq();
+                    DataPoint p = c.next();
+                    System.out.printf("  %8d  %s  %-7s %-4s $%-10.2f qty=%d%n", seq, dateTime(p.getTimestampMillis()),
+                            p.getSymbol(), p.getSide(), p.getPrice(), p.getQuantity());
+                }
+            }
+        } catch (RuntimeException e) {
+            System.out.println("Storage error: " + reason(e));
+        }
+    }
+
+    /** e.g. 2026-11-20T11:14:03.221, in the local zone. */
+    private static String dateTime(long epochMillis) {
+        return LocalDateTime.ofInstant(Instant.ofEpochMilli(epochMillis), ZoneId.systemDefault()).format(DUMP_TIME);
+    }
+
+    /** fsync the store; a failure is reported in one line rather than thrown. */
+    private void syncStore() {
+        try {
+            store.sync();
+        } catch (IOException | RuntimeException e) {
+            System.out.println("Storage error: " + reason(e) + ". The last trades may not be on disk.");
+        }
+    }
+
+    /** On the way out: sync, then close. Always releases the data directory, and never throws. */
+    private void closeStore() {
+        try {
+            store.sync();
+        } catch (IOException | RuntimeException e) {
+            System.out.println("Storage error: " + reason(e) + ". The last trades may not be on disk.");
+            try {
+                store.close(); // still releases the files and the directory lock
+            } catch (IOException | RuntimeException again) {
+                // the same failure; already reported
+            }
+            return;
+        }
+        try {
+            store.close();
+        } catch (IOException | RuntimeException e) {
+            System.out.println("Storage error while closing: " + reason(e));
+        }
+    }
+
+    /**
+     * An exception's message, prefixed by its type where the message alone
+     * says nothing: a FileSystemException's message is just the file name,
+     * and some (ClosedChannelException) have none.
+     */
+    private static String reason(Exception e) {
+        String type = e.getClass().getSimpleName();
+        if (e.getMessage() == null) return type;
+        return e instanceof java.nio.file.FileSystemException ? type + ": " + e.getMessage() : e.getMessage();
     }
 
     // ---- Queries: SELECT ... and ALSO ... ----
@@ -682,6 +935,11 @@ public class Shell {
         System.out.println("                    changes.");
         System.out.println("  (Enter)           Stop watching. The generator keeps running.");
         System.out.println("  STOP DATA;        Stop the generator. The window can still be queried.");
+        System.out.println("  WAIT DATA;        Wait until a run started with events=<n> has produced them all.");
+        System.out.println("  STORAGE;          Every trade is also appended to disk (--data-dir, default data):");
+        System.out.println("                    show how many are stored, in how many segments, how many are fsynced.");
+        System.out.println("  DUMP [FIRST <n> | LAST <n>];");
+        System.out.println("                    Print stored trades with their sequence numbers (default LAST 10).");
         System.out.println("  HELP;  EXIT");
         System.out.println("Tickers: " + String.join(", ", FinancialDataGenerator.SYMBOLS));
     }

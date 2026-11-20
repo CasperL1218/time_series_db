@@ -10,3 +10,6 @@ out/
 # OS
 .DS_Store
 Thumbs.db
+
+# Shell data directory (DiskStore segments)
+data/

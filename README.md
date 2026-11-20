@@ -20,7 +20,12 @@ answer as each new event arrives.
   starts the generator, `SELECT AVERAGE, COUNT WHERE ticker = AAPL AND price < 200;`
   defines a query over the moving window, `WINDOW;` watches it live, and
   `ALSO WHERE side = BUY;` adds to it
-- ⏳ Persistence is a later milestone (see [Roadmap](#roadmap))
+- ✅ Append-only disk log: the shell appends every trade to a segmented
+  log on disk before the engines see it, and reads it back with `STORAGE;`
+  and `DUMP;` (see [Storage layer](#storage-layer))
+- ⏳ Not built yet: historical range queries over the stored log, and
+  filling a window from disk. `SELECT` and `WINDOW` still see only what the
+  live generator fed the window (see [Roadmap](#roadmap))
 
 The team has four members: Casper Liao, Daniel Zlotnick, Saanvi
 Ibrahimpatnam, and Jasmine Li.
@@ -65,15 +70,23 @@ FinancialDataGenerator  --generates-->  DataPoint
                                     onUpdate listener               -- the shell's live view; only called for accepted events
 ```
 
-The shell runs the generator on a background thread and feeds every trade
-to **two** engines with the same window type and size:
+The shell runs the generator on a background thread. Each trade is first
+appended to the disk store, then fed to **two** engines with the same
+window type and size:
 
 ```
-                           +--> StreamEngine "all"    (no filter)           keeps every trade, so a new SELECT
-FinancialDataGenerator ----+                                                can start from the whole window
-  (background thread)      +--> StreamEngine "query"  (current filter       what WINDOW shows; rebuilt by
+                           +--> store.append(dp)      DiskStore (disk)      every trade ever generated, in order;
+                           |    (first, outside the                         read back by STORAGE / DUMP
+                           |     shell's lock)
+FinancialDataGenerator ----+--> StreamEngine "all"    (no filter)           keeps every trade, so a new SELECT
+  (background thread)      |                                                can start from the whole window
+                           +--> StreamEngine "query"  (current filter       what WINDOW shows; rebuilt by
                                                        + aggregators)       every SELECT and ALSO
 ```
+
+The engines never read the store: the windows still hold only what the
+live generator fed them. If an append fails, that trade is not given to
+the engines and the generator stops.
 
 **Core**
 - **`DataPoint`**: an immutable `(timestamp, symbol, price, quantity, side)`
@@ -138,16 +151,26 @@ FinancialDataGenerator ----+                                                can 
 - **`Shell`**: the interactive shell described below. It parses the
   `;`-terminated statements (the `SELECT` / `WHERE` / `GROUP BY` clauses
   itself, `WHERE` conditions with `FilterParser`), runs the
-  generator thread and the two engines, and prints the live views.
+  generator thread and the two engines, appends every trade to the
+  `DiskStore`, and prints the live views.
 
-Everything runs in memory, with no disk I/O.
+**Storage** (package `com.tsdb.storage`, see [Storage layer](#storage-layer))
+- **`DiskStore`**, **`RecordCursor`**, **`RecordCodec`**, **`Segment`**: the
+  append-only log on disk. It depends only on `DataPoint`, not on any
+  query class.
+
+The engine and its windows, filters and aggregators run in memory; the
+only disk I/O is the store's append-only log.
 
 ### Project Layout
 
 ```
-src/main/java/com/tsdb/   shell, engine, windows, filters, aggregators, generator
-src/test/java/com/tsdb/   self-contained test harnesses (each has a main())
-out/                      compiled classes (git-ignored)
+src/main/java/com/tsdb/           shell, engine, windows, filters, aggregators, generator
+src/main/java/com/tsdb/storage/   the disk store (append-only segmented log)
+src/test/java/com/tsdb/           self-contained test harnesses (each has a main())
+src/test/java/com/tsdb/storage/   storage test harnesses
+out/                              compiled classes (git-ignored)
+data/                             the shell's default data directory (git-ignored)
 ```
 
 ### Build
@@ -182,8 +205,13 @@ generator works in the background. The query language reads like SQL:
   you press **Enter** (an empty line) or type another statement.
 
 ```bash
-java -cp out com.tsdb.Shell
+java -cp out com.tsdb.Shell                      # stores trades in ./data
+java -cp out com.tsdb.Shell --data-dir /tmp/tsdb # or anywhere else
 ```
+
+At startup the shell opens the data directory (creating it if needed) and
+prints one line, e.g. `Storage: data (70 record(s) in 1 segment(s))`, with
+`; recovered <K> torn byte(s)` added if it had to repair a torn segment.
 
 | Statement | What it does |
 |---|---|
@@ -193,14 +221,17 @@ java -cp out com.tsdb.Shell
 | `ALSO [SELECT <aggregates>] [WHERE <condition>] [GROUP BY symbol\|side];` | **Add to** the current query, using at least one clause. `WHERE` narrows it: after `SELECT * WHERE ticker = AAPL;`, `ALSO WHERE price < 200;` gives `ticker = AAPL AND price < 200`. `SELECT` adds aggregates to the ones it has. `GROUP BY` replaces the grouping. Can be repeated. |
 | `WINDOW;` | Watch the current query live. |
 | Enter (empty line) | Stop watching. The generator keeps running. |
-| `STOP DATA;` | Stop the generator. The window stays and can still be queried (`WINDOW` then prints once); `GENERATE DATA` starts over with a new window. |
-| `HELP;`, `EXIT` | List the statements; quit. |
+| `STOP DATA;` | Stop the generator. The window stays and can still be queried (`WINDOW` then prints once); `GENERATE DATA` starts over with a new window. The store is fsynced. |
+| `WAIT DATA;` | Block until a run started with `events=<n>` has produced all of them (prints a message and returns if nothing is running). Statements after it, even on the same line, wait too, which makes piped, scripted sessions deterministic. |
+| `STORAGE;` | Show the disk store: records stored, segments and bytes on disk, how many records are still buffered or not yet fsynced, the newest timestamp. |
+| `DUMP [FIRST <n> \| LAST <n>];` | Print stored trades with their sequence numbers and full date-time, oldest first. Default `LAST 10`. Reads the store, not the window, so it is not affected by the current query. |
+| `HELP;`, `EXIT` | List the statements; quit (the store is fsynced and closed first). |
 
 Clauses go in the order `SELECT`, `WHERE`, `GROUP BY`, as in SQL. The
 full grammar (keywords are case-insensitive; line breaks count as spaces):
 
 ```
-statement  := ( generate | select | also | WINDOW | STOP DATA | HELP ) ";"   |   EXIT
+statement  := ( generate | select | also | WINDOW | STOP DATA | HELP | storage ) ";"   |   EXIT
 generate   := GENERATE DATA window=(count|time) size=<n> [interval=<ms>] [events=<n>]
 select     := SELECT ( "*" | aggregates ) [WHERE condition] [GROUP BY group]
 also       := ALSO [SELECT aggregates] [WHERE condition] [GROUP BY group]     -- at least one clause
@@ -208,6 +239,7 @@ aggregates := aggregate ( "," aggregate )*
 aggregate  := (AVERAGE | AVG | SUM | MIN | MAX) [price | qty]   |   COUNT
 group      := symbol | ticker | side
 condition  := see "Condition syntax" below
+storage    := WAIT DATA   |   STORAGE   |   DUMP [ (FIRST | LAST) <n> ]
 ```
 
 **Coming from the old commands**
@@ -251,10 +283,16 @@ error and keeps watching. A statement that fails changes nothing. When the
 generator finishes its `events`, the prompt comes back by itself. An empty
 window gives `NaN` for sum/average/min/max and `0` for count.
 
-The generator's simulated clock starts at the current time and moves
-forward by a random amount between `interval/2` and `2*interval` per
-trade, so trade timestamps advance at roughly real-time speed. Time
-windows always use these trade timestamps, not the wall clock.
+The generator's simulated clock starts at the current time (or at the
+newest stored trade, if that is later, so the stored log never goes back
+in time) and moves forward by a random amount between `interval/2` and
+`2*interval` per trade, so trade timestamps advance at roughly real-time
+speed. Time windows always use these trade timestamps, not the wall clock.
+
+**Disk use.** Every trade takes 32 bytes on disk. `interval=0` with no
+`events` limit generates trades as fast as the machine can, about 32 bytes
+per trade until `STOP DATA`: millions of trades, hundreds of MB, within
+seconds.
 
 Example session. Lines marked `<-` are what was typed; the rest is output:
 
@@ -324,6 +362,82 @@ Showing SELECT COUNT, MIN price, MAX price over a count-based window (last 5 poi
   11:50:09.617  COUNT = 5   MIN price = 132.76   MAX price = 472.30
 ```
 
+### Storage layer
+
+Package `com.tsdb.storage` keeps every trade on disk in an append-only
+log. It uses only the JDK, depends only on `DataPoint` (no query classes),
+uses no memory-mapped files (a mapped file can't be truncated or deleted
+on Windows), and runs no background threads.
+
+**Records.** Each trade is a fixed 32-byte little-endian record:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `timestampMillis` (int64) |
+| 8 | 8 | `price`, as `Double.doubleToRawLongBits` (round-trips bit for bit) |
+| 16 | 4 | `quantity` (int32) |
+| 20 | 1 | `side`: 0 = BUY, 1 = SELL (anything else is corrupt) |
+| 21 | 7 | `symbol`: 1 to 7 printable ASCII characters (`!`..`~`), zero-padded |
+| 28 | 4 | CRC32C of bytes 0..27 |
+
+**Segments.** The log is a directory of files
+`seg-<20-digit baseSeq>.tsd`, each holding up to 1,048,576 records
+(32 MiB). A file starts with a 32-byte header (magic `TSDB`, version 1,
+record size 32, `baseSeq`, capacity, and a CRC32C of the header), and
+record `i` is at byte `32 + 32*i`. A record's **sequence number** is
+`baseSeq + i`: its identity in the log, not stored per record. Since a
+record's place in the file follows from its seq, the log needs no index.
+Only the newest segment is ever written. Timestamps never decrease across
+the whole log (equal timestamps are allowed).
+
+**API** (`DiskStore`, thread-safe):
+- `DiskStore.open(dir, Options.defaults())`: opens or creates the store,
+  recovering a torn tail (below), and holds a lock file so a second
+  process (or a second `open`) gets `IOException("data directory in use")`.
+  `close()` syncs and releases everything.
+- `append(dp)` returns the record's seq. A record can be read by every
+  scan as soon as `append` returns, even while it is only in the buffer.
+  `flush()` writes the buffer to the OS; `sync()` also fsyncs.
+- `scanAll()`, `scanFromSeq(seq)`, `scan(fromTs, toTs)` (inclusive) return
+  a `RecordCursor`. A cursor sees exactly the records that existed when it
+  was created, and reads 64 KB at a time, so memory stays constant. A time
+  range starts with a binary search: across segments, then within one.
+  `cursor.nextSeq()` is the seq the next record would have; once a cursor
+  is exhausted, `scanFromSeq(cursor.nextSeq())` returns exactly what was
+  appended since, which is how a reader can tail the log.
+- `nextSeq()`, `lastTimestamp()`, `stats()` (a `StoreStats` record).
+
+**Out-of-order rule.** `append` rejects a trade older than
+`lastTimestamp()` (and an invalid symbol) with `IllegalArgumentException`,
+and nothing is written. The shell never sends one: each run's clock starts
+at the newest stored timestamp or later.
+
+**Durability.** Records go into a 64 KB buffer (2,048 records), which is
+written to the OS when it fills, and written plus fsynced once
+`syncIntervalMs` (1,000 ms) has passed since the last fsync. The store is
+durable to within `syncIntervalMs`, as long as appends keep arriving,
+because there is no background thread. A process crash loses at most the
+unflushed buffer (up to 2,048 records). An OS crash or power loss can lose
+up to about `syncIntervalMs` more. The shell calls `sync()` explicitly on
+`STOP DATA`, when the generator finishes its `events`, and on `EXIT`.
+
+**Recovery.** `open` repairs only what a crash in the middle of an append
+explains. In the newest segment it checks every record (CRC, side value,
+timestamps in order). From the first bad or partial record on, it copies
+the bytes to `<name>.torn-<epochMillis>` next to the segment and truncates
+the file to the last good record; `stats().recoveredTornBytes()` reports
+how many bytes were dropped. A newest segment shorter than its 32-byte
+header (the process died while creating it) is moved aside the same way.
+Every older segment must have a valid header, the right `baseSeq`, and
+exactly `capacity` records. Anything else (a bad header, a missing or
+renamed segment, a short older segment) makes `open` throw
+`CorruptStoreException` and change nothing. It never guesses.
+
+**Interrupts.** A `FileChannel` closes itself when the thread using it is
+interrupted, which would break the store until it is reopened. The shell
+therefore stops its generator with a flag, not `Thread.interrupt()`. Don't
+call the store from a thread that may be interrupted.
+
 ### Tests
 
 The tests are self-contained harnesses with no external test framework.
@@ -335,7 +449,15 @@ java -cp out com.tsdb.WindowTest           # window eviction            -> ALL T
 java -cp out com.tsdb.EngineContractTest   # filter -> window -> aggregators contract -> ALL CONTRACT TESTS PASSED
 java -cp out com.tsdb.FilterTest           # operators, AND/OR, bad input -> ALL 66 FILTER TESTS PASSED
 java -cp out com.tsdb.AggregatorTest       # aggregates vs brute force, group by, shell aggregate syntax -> ALL 51 AGGREGATOR TESTS PASSED
+java -cp out com.tsdb.storage.RecordCodecTest      # 32-byte record format, every byte flip caught -> ALL 37 RECORD CODEC TESTS PASSED
+java -cp out com.tsdb.storage.SegmentTest          # header checks, binary search, torn-tail recovery -> ALL 83 SEGMENT TESTS PASSED
+java -cp out com.tsdb.storage.DiskStoreTest        # scans, rolling, reopen, crashes, corruption, lock, concurrency -> ALL 120 DISK STORE TESTS PASSED
+java -cp out com.tsdb.storage.StorageRoundTripTest # 10,000 generated trades through disk and back -> ALL 12 ROUND-TRIP TESTS PASSED
 ```
+
+The storage tests work in temporary directories and delete them afterwards.
+`DiskStoreTest` also starts a child JVM with `-Xmx16m` that writes and
+scans 200,000 records, to show a scan doesn't load everything into memory.
 
 ## Roadmap
 
@@ -353,10 +475,16 @@ VERSION 4  ✅ done
   Compound filter conditions (AND/OR)
   SQL-like shell language: SELECT ... WHERE ... GROUP BY ...;  ALSO to refine;  WINDOW to watch
 
-VERSION 5 / final project
-  Persistence to disk, larger datasets, real financial data,
-  more advanced queries (range queries, OHLC bucketed aggregation,
-  multi-series alignment). See "Original Proposal" below.
+STORAGE LAYER  ✅ done (first step toward Version 5)
+  Append-only disk log: every trade is stored, survives restarts, and can be
+  scanned by sequence number or time range through the DiskStore API
+
+VERSION 5 / final project  ⏳ not built yet
+  Historical range queries over the stored log (a query command on top of
+  DiskStore.scan), filling a window from disk instead of only from the live
+  generator, larger datasets, real financial data, more advanced queries
+  (OHLC bucketed aggregation, multi-series alignment).
+  See "Original Proposal" below.
 ```
 
 ## Original Proposal (Future Direction)
@@ -385,6 +513,14 @@ milestone builds toward, once persistence becomes the focus again.
 - Points are stored in time order within each segment, enabling efficient
   range scans and binary search by timestamp.
 
+> **As built** (see [Storage layer](#storage-layer)): there is **one log for
+> all symbols**, not one file per series. It is split into segments by
+> **record count** (1,048,576 records each), not by time. Because the whole
+> log is in time order, a time range is still found by binary search: first
+> over the segments' first and last timestamps, then inside one segment. A
+> per-symbol query would scan the range and filter it. Per-series files are
+> out of scope for now.
+
 #### 3. Basic Queries
 - **Range query**: retrieve all points for a given series within a specified
   time interval.
@@ -399,7 +535,8 @@ milestone builds toward, once persistence becomes the focus again.
 
 #### 5. Query Execution Model
 Each query is processed in three stages:
-1. **Resolve** — look up the segment files associated with the requested series.
+1. **Resolve** — look up the segment files associated with the requested series
+   (as built, every segment holds all series; see the note above).
 2. **Prune** — filter segments to those overlapping the requested time
    range (predicate pushdown), avoiding unnecessary disk reads.
 3. **Scan and aggregate** — read only the relevant segments and compute the
