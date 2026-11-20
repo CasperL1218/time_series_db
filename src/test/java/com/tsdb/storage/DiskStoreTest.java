@@ -580,20 +580,39 @@ public class DiskStoreTest {
     /**
      * Runs this class in a child JVM with -Xmx16m to write and then scan
      * 200,000 records. Materializing them as DataPoints would need roughly
-     * 20 MB, so passing shows the cursor streams in chunks.
+     * 20 MB, so passing shows the cursor streams in chunks. The child's
+     * output goes to a file and the wait has a deadline, so a child that
+     * can't start or never finishes fails the test instead of hanging it.
+     * -Dtsdb.test.java=&lt;path&gt; overrides the child's java binary, to try those paths.
      */
     private static void testLargeScanUnderSmallHeap() throws Exception {
+        final String name = "200,000-record scan under -Xmx16m in a child JVM";
         Path dir = Files.createTempDirectory("tsdb-store");
+        Path log = Files.createTempFile("tsdb-child", ".log");
         try {
-            String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-            Process p = new ProcessBuilder(java, "-Xmx16m", "-cp", System.getProperty("java.class.path"),
-                    DiskStoreTest.class.getName(), "--large-scan", dir.toString())
-                    .redirectErrorStream(true).start();
-            String out = new String(p.getInputStream().readAllBytes()).trim();
-            int code = p.waitFor();
-            check("200,000-record scan under -Xmx16m (child JVM: " + out + ")", code, 0);
+            String javaBin = System.getProperty("tsdb.test.java",
+                    Path.of(System.getProperty("java.home"), "bin", "java").toString());
+            Process p;
+            try {
+                p = new ProcessBuilder(javaBin, "-Xmx16m", "-cp", System.getProperty("java.class.path"),
+                        DiskStoreTest.class.getName(), "--large-scan", dir.toString())
+                        .redirectErrorStream(true).redirectOutput(log.toFile()).start();
+            } catch (IOException e) {
+                failures++;
+                System.out.println("  FAIL " + name + " -- could not start " + javaBin + ": " + e.getMessage());
+                return;
+            }
+            if (!p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS)) {
+                p.destroyForcibly().waitFor(10, java.util.concurrent.TimeUnit.SECONDS);
+                failures++;
+                System.out.println("  FAIL " + name + " -- child still running after 120 s, killed");
+                return;
+            }
+            String out = String.join(" | ", Files.readAllLines(log)).trim();
+            check(name + " (" + out + ")", p.exitValue(), 0);
         } finally {
             SegmentTest.deleteTree(dir);
+            Files.deleteIfExists(log);
         }
     }
 

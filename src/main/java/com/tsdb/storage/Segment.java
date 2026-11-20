@@ -93,6 +93,7 @@ final class Segment {
             ch.close();
             throw e;
         }
+        syncDirectory(dir);
         return new Segment(path, ch, baseSeq, capacity, 0);
     }
 
@@ -251,6 +252,7 @@ final class Segment {
             }
             out.force(true);
         }
+        syncDirectory(torn.getParent());
         return torn;
     }
 
@@ -269,7 +271,9 @@ final class Segment {
         while (true) {
             Path torn = newTornPath(file);
             try {
-                return Files.move(file, torn);
+                Path moved = Files.move(file, torn);
+                syncDirectory(file.getParent());
+                return moved;
             } catch (FileAlreadyExistsException raced) {
                 // someone took that name between the check and the move; try the next one
             }
@@ -349,6 +353,20 @@ final class Segment {
     }
 
     // ---- helpers ----
+
+    /**
+     * Best-effort fsync of a directory, so a newly created or renamed file's
+     * directory entry survives a power loss along with its fsynced data.
+     * Windows can't open a directory as a FileChannel, so any IOException is
+     * ignored: there, NTFS journals the entry itself.
+     */
+    static void syncDirectory(Path dir) {
+        try (FileChannel d = FileChannel.open(dir, StandardOpenOption.READ)) {
+            d.force(true);
+        } catch (IOException ignored) {
+            // not supported on this platform/filesystem; nothing more we can do
+        }
+    }
 
     static ByteBuffer header(long baseSeq, int capacity) {
         ByteBuffer h = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN);

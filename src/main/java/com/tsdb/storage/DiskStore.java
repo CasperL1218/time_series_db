@@ -58,6 +58,13 @@ import java.util.regex.Pattern;
  * close; scans run outside it. A {@code .lock} file held with
  * {@link FileChannel#tryLock()} keeps a second process (or a second open
  * in this one) out of the directory.
+ *
+ * <b>Never call the store from a thread that may be interrupted.</b> Its
+ * files are FileChannels, which are interruptible: an interrupt during (or
+ * pending at the start of) any read, write or fsync closes that channel for
+ * every thread, and the store fails with ClosedChannelException until it is
+ * reopened. Stop a writer or reader with a flag instead of
+ * Thread.interrupt().
  */
 public final class DiskStore implements AutoCloseable {
 
