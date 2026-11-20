@@ -16,15 +16,16 @@ answer as each new event arrives.
 - ✅ Sliding windows, count-based and time-based (V1)
 - ✅ Filtering, with compound AND/OR conditions (V2 + V4)
 - ✅ Incremental aggregation: COUNT, SUM, AVERAGE, MIN, MAX, and GROUP BY (V3)
-- ✅ Interactive shell: `GENERATE DATA window=count size=20` starts the
-  generator, then queries (`FILTER ticker = AAPL AND price < 200 AGGREGATE AVERAGE`,
-  `ALSO FILTER ...`) run against the moving window from the same terminal
+- ✅ Interactive shell with a SQL-like language: `GENERATE DATA window=count size=20;`
+  starts the generator, `SELECT AVERAGE, COUNT WHERE ticker = AAPL AND price < 200;`
+  defines a query over the moving window, `WINDOW;` watches it live, and
+  `ALSO WHERE side = BUY;` adds to it
 - ✅ Append-only disk log: the shell appends every trade to a segmented
-  log on disk before the engines see it, and reads it back with `STORAGE`
-  and `DUMP` (see [Storage layer](#storage-layer))
+  log on disk before the engines see it, and reads it back with `STORAGE;`
+  and `DUMP;` (see [Storage layer](#storage-layer))
 - ⏳ Not built yet: historical range queries over the stored log, and
-  filling a window from disk. The windows and queries are still fed only
-  by the live generator (see [Roadmap](#roadmap))
+  filling a window from disk. `SELECT` and `WINDOW` still see only what the
+  live generator fed the window (see [Roadmap](#roadmap))
 
 The team has four members: Casper Liao, Daniel Zlotnick, Saanvi
 Ibrahimpatnam, and Jasmine Li.
@@ -77,10 +78,10 @@ window type and size:
                            +--> store.append(dp)      DiskStore (disk)      every trade ever generated, in order;
                            |    (first, outside the                         read back by STORAGE / DUMP
                            |     shell's lock)
-FinancialDataGenerator ----+--> StreamEngine "all"    (no filter)           keeps every trade, so a new FILTER
+FinancialDataGenerator ----+--> StreamEngine "all"    (no filter)           keeps every trade, so a new SELECT
   (background thread)      |                                                can start from the whole window
-                           +--> StreamEngine "query"  (current filter       what WINDOW and the aggregates show;
-                                                       + aggregators)       rebuilt by every query command
+                           +--> StreamEngine "query"  (current filter       what WINDOW shows; rebuilt by
+                                                       + aggregators)       every SELECT and ALSO
 ```
 
 The engines never read the store: the windows still hold only what the
@@ -148,7 +149,8 @@ the engines and the generator stops.
 
 **Entry point**
 - **`Shell`**: the interactive shell described below. It parses the
-  commands (aggregates itself, conditions with `FilterParser`), runs the
+  `;`-terminated statements (the `SELECT` / `WHERE` / `GROUP BY` clauses
+  itself, `WHERE` conditions with `FilterParser`), runs the
   generator thread and the two engines, appends every trade to the
   `DiskStore`, and prints the live views.
 
@@ -190,12 +192,17 @@ javac -d out (Get-ChildItem -Recurse -Filter *.java src/main/java,src/test/java)
 ### Run the shell
 
 The shell runs the data generator and the queries in one terminal. The
-generator works in the background. `WINDOW` and `AGGREGATE` are **live**:
-they print their result right away and again as the window moves (the
-window after every trade, an aggregate line whenever a value changes),
-until you press **Enter** (an empty line) or type another command, which
-replaces them. `GENERATE DATA` and a `FILTER` without `AGGREGATE` print one
-line and return to the prompt.
+generator works in the background. The query language reads like SQL:
+`SELECT` defines a query, `WINDOW` watches it, and `ALSO` adds to it.
+
+- **Every statement ends with `;`** and can span several lines. While a
+  statement is unfinished, the prompt changes from `tsdb>` to `->`.
+- **`SELECT` starts a new query from scratch**, over everything in the
+  window. **`ALSO` adds to the current query** instead of starting over.
+- A query only defines what to look at and prints how many trades match.
+  **`WINDOW;` watches it live**: the matching trades after every trade, or
+  a line of aggregate values whenever a value changes. It keeps going until
+  you press **Enter** (an empty line) or type another statement.
 
 ```bash
 java -cp out com.tsdb.Shell                      # stores trades in ./data
@@ -206,22 +213,49 @@ At startup the shell opens the data directory (creating it if needed) and
 prints one line, e.g. `Storage: data (70 record(s) in 1 segment(s))`, with
 `; recovered <K> torn byte(s)` added if it had to repair a torn segment.
 
-| Command | What it does |
+| Statement | What it does |
 |---|---|
-| `GENERATE DATA window=<count\|time> size=<n> [interval=<ms>] [events=<n>]` | Start generating trades in the background. Labels can come in any order, and spaces around `=` are fine. `window=count size=N` keeps the last `N` trades; `window=time size=S` keeps the last `S` seconds of trades. `interval`: about how often a trade arrives, in ms (default `400`). `events`: how many trades to make (`0` or omitted = until `STOP DATA`). |
-| `WINDOW` | Watch the current query's window trade by trade: the trades that match the current filter. |
-| `AGGREGATE <aggregates>` | Watch aggregates over the current query's window. Aggregates are `AVERAGE`, `SUM`, `MIN`, `MAX` (each optionally followed by `price` or `qty`; `price` is the default) and `COUNT`, separated by commas: `AGGREGATE AVERAGE, MAX qty, COUNT`. `AVG` works too. |
-| `AGGREGATE <aggregates> GROUP BY symbol\|side` | One value per ticker (or per side) for every aggregate in the list: `AGGREGATE AVERAGE, COUNT GROUP BY symbol`. `ticker` works too. `GROUP BY` goes last. |
-| `FILTER <condition> [AGGREGATE <aggregates>]` | Start a **new** query over everything in the window: only the matching trades, now and as they arrive. Prints how many trades match; with `AGGREGATE`, watches the aggregates. `FILTER NONE` goes back to the whole window. |
-| `ALSO FILTER <condition> [AGGREGATE <aggregates>]` | **Narrow** the current query: after `FILTER ticker = AAPL`, `ALSO FILTER price < 200` gives `ticker = AAPL AND price < 200`. Keeps (and watches) the query's aggregates unless you give new ones. Can be repeated. |
+| `GENERATE DATA window=<count\|time> size=<n> [interval=<ms>] [events=<n>];` | Start generating trades in the background. Labels can come in any order, and spaces around `=` are fine. `window=count size=N` keeps the last `N` trades; `window=time size=S` keeps the last `S` seconds of trades. `interval`: about how often a trade arrives, in ms (default `400`). `events`: how many trades to make (`0` or omitted = until `STOP DATA`). The query starts as `SELECT *`. |
+| `SELECT * [WHERE <condition>];` | A **new** query: the trades that match the condition (or every trade without `WHERE`), now and as they arrive. |
+| `SELECT <aggregates> [WHERE <condition>] [GROUP BY symbol\|side];` | A **new** query computing aggregates over the matching trades. Aggregates are `AVERAGE`, `SUM`, `MIN`, `MAX` (each optionally followed by `price` or `qty`; `price` is the default) and `COUNT`, separated by commas, e.g. `SELECT AVERAGE, MAX qty, COUNT;`. `AVG` works too. `GROUP BY` gives one value per ticker (or per side) for every aggregate; `ticker` works too. |
+| `ALSO [SELECT <aggregates>] [WHERE <condition>] [GROUP BY symbol\|side];` | **Add to** the current query, using at least one clause. `WHERE` narrows it: after `SELECT * WHERE ticker = AAPL;`, `ALSO WHERE price < 200;` gives `ticker = AAPL AND price < 200`. `SELECT` adds aggregates to the ones it has. `GROUP BY` replaces the grouping. Can be repeated. |
+| `WINDOW;` | Watch the current query live. |
 | Enter (empty line) | Stop watching. The generator keeps running. |
-| `STOP DATA` | Stop the generator. The window stays and can still be queried (each query then prints once); `GENERATE DATA` starts over with a new window. The store is fsynced. |
-| `WAIT DATA` | Block until a run started with `events=<n>` has produced all of them (prints a message and returns if nothing is running). Makes piped, scripted sessions deterministic. |
-| `STORAGE` | Show the disk store: records stored, segments and bytes on disk, how many records are still buffered or not yet fsynced, the newest timestamp. |
-| `DUMP [FIRST <n> \| LAST <n>]` | Print stored trades with their sequence numbers and full date-time, oldest first. Default `LAST 10`. |
-| `HELP`, `EXIT` | List the commands; quit (the store is fsynced and closed first). |
+| `STOP DATA;` | Stop the generator. The window stays and can still be queried (`WINDOW` then prints once); `GENERATE DATA` starts over with a new window. The store is fsynced. |
+| `WAIT DATA;` | Block until a run started with `events=<n>` has produced all of them (prints a message and returns if nothing is running). Statements after it, even on the same line, wait too, which makes piped, scripted sessions deterministic. |
+| `STORAGE;` | Show the disk store: records stored, segments and bytes on disk, how many records are still buffered or not yet fsynced, the newest timestamp. |
+| `DUMP [FIRST <n> \| LAST <n>];` | Print stored trades with their sequence numbers and full date-time, oldest first. Default `LAST 10`. Reads the store, not the window, so it is not affected by the current query. |
+| `HELP;`, `EXIT` | List the statements; quit (the store is fsynced and closed first). |
 
-**Condition syntax**
+Clauses go in the order `SELECT`, `WHERE`, `GROUP BY`, as in SQL. The
+full grammar (keywords are case-insensitive; line breaks count as spaces):
+
+```
+statement  := ( generate | select | also | WINDOW | STOP DATA | HELP | storage ) ";"   |   EXIT
+generate   := GENERATE DATA window=(count|time) size=<n> [interval=<ms>] [events=<n>]
+select     := SELECT ( "*" | aggregates ) [WHERE condition] [GROUP BY group]
+also       := ALSO [SELECT aggregates] [WHERE condition] [GROUP BY group]     -- at least one clause
+aggregates := aggregate ( "," aggregate )*
+aggregate  := (AVERAGE | AVG | SUM | MIN | MAX) [price | qty]   |   COUNT
+group      := symbol | ticker | side
+condition  := see "Condition syntax" below
+storage    := WAIT DATA   |   STORAGE   |   DUMP [ (FIRST | LAST) <n> ]
+```
+
+**Coming from the old commands**
+
+| Old | New |
+|---|---|
+| `FILTER ticker = AAPL` | `SELECT * WHERE ticker = AAPL;` |
+| `FILTER ticker = AAPL AGGREGATE AVERAGE, COUNT` | `SELECT AVERAGE, COUNT WHERE ticker = AAPL;` then `WINDOW;` |
+| `AGGREGATE AVERAGE GROUP BY symbol` | `SELECT AVERAGE GROUP BY symbol;` (starts over; use `ALSO SELECT AVERAGE;` to keep the current filter) |
+| `ALSO FILTER price < 200` | `ALSO WHERE price < 200;` |
+| `FILTER NONE` | `SELECT *;` |
+| `WINDOW` (always listed trades) | `WINDOW;` (shows the query's trades, or its aggregates if it has any) |
+
+Typing an old command prints an error that shows the new form.
+
+**Condition syntax** (after `WHERE`)
 
 | Part | Options |
 |---|---|
@@ -232,22 +266,22 @@ prints one line, e.g. `Storage: data (70 record(s) in 1 segment(s))`, with
 
 **How queries work.** A query is a standing filter plus its aggregators,
 running in the "query" engine, so the aggregates update incrementally
-(`onInsert` / `onEvict`) as trades enter and leave its window. `FILTER`
+(`onInsert` / `onEvict`) as trades enter and leave its window. `SELECT`
 builds the query from the "all" engine's window, so it always starts from
-everything, no matter what the previous query was. `ALSO FILTER` and
-`AGGREGATE` build it from the current query's trades. Trades the filter
-rejects never enter the query's window and never evict anything, so with a
-`count` window the query holds the last `<size>` *matching* trades, and
-with a `time` window its trades only age out when a newer matching trade
-arrives. A live aggregate line starts with the time of the newest trade in
-the query's window, and nothing prints while the values stay the same.
+everything, no matter what the previous query was. `ALSO` builds it from
+the current query's trades. Trades the filter rejects never enter the
+query's window and never evict anything, so with a `count` window the
+query holds the last `<size>` *matching* trades, and with a `time` window
+its trades only age out when a newer matching trade arrives. A live
+aggregate line starts with the time of the newest trade in the query's
+window, and nothing prints while the values stay the same.
 
-Commands and keywords are case-insensitive. A misspelled ticker
-(`FILTER ticker = APPL`) is an error instead of silently emptying the
-query, and a command with a mistake typed while watching prints the error
-and keeps watching. When the generator finishes its `events`, the prompt
-comes back by itself. An empty window gives `NaN` for sum/average/min/max
-and `0` for count.
+Keywords are case-insensitive. A misspelled ticker
+(`WHERE ticker = APPL`) is an error instead of silently emptying the
+query, and a statement with a mistake typed while watching prints the
+error and keeps watching. A statement that fails changes nothing. When the
+generator finishes its `events`, the prompt comes back by itself. An empty
+window gives `NaN` for sum/average/min/max and `0` for count.
 
 The generator's simulated clock starts at the current time (or at the
 newest stored trade, if that is later, so the stored log never goes back
@@ -263,66 +297,69 @@ seconds.
 Example session. Lines marked `<-` are what was typed; the rest is output:
 
 ```
-tsdb> GENERATE DATA window=count size=5 interval=60
-Generating trades into a count-based window (last 5 point(s)), about one every 60 ms until STOP DATA. WINDOW shows it.
+tsdb> GENERATE DATA window=count size=5 interval=80;
+Generating trades into a count-based window (last 5 point(s)), about one every 80 ms until STOP DATA. The query starts as SELECT *; WINDOW; watches it.
 
-tsdb> WINDOW
-Watching every trade in a count-based window (last 5 point(s)). Press Enter to stop.
+tsdb> WINDOW;
+Watching SELECT * over a count-based window (last 5 point(s)). Press Enter to stop.
 Window (5 trade(s)):
-  12:49:11.728 GOOG   BUY  $202.75     qty=249
-  12:49:11.834 AAPL   BUY  $88.77      qty=259
-  12:49:11.927 GOOG   BUY  $203.05     qty=347
-  12:49:12.011 MSFT   SELL $87.49      qty=488
-  12:49:12.058 AAPL   BUY  $88.71      qty=93
+  11:50:07.737 MSFT   SELL $157.75     qty=237
+  11:50:07.823 GOOG   SELL $369.51     qty=475
+  11:50:07.912 AMZN   SELL $472.78     qty=33
+  11:50:08.005 AAPL   BUY  $131.32     qty=453
+  11:50:08.134 AAPL   BUY  $131.36     qty=108
 
-Incoming: 12:49:12.092 GOOG   SELL $202.06     qty=136
+Incoming: 11:50:08.215 GOOG   SELL $368.97     qty=418
 Window (5 trade(s)):
-  12:49:11.834 AAPL   BUY  $88.77      qty=259
+  11:50:07.823 GOOG   SELL $369.51     qty=475
   ...
                                                    <- Enter
-Stopped watching. The generator keeps running; STOP DATA stops it.
+Stopped watching. The generator keeps running; STOP DATA; stops it.
 
-tsdb> AGGREGATE AVERAGE, MAX qty, COUNT
-Watching AVERAGE price, MAX quantity, COUNT of every trade in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
-  12:49:12.137  AVERAGE price = 156.79   MAX quantity = 488   COUNT = 5
-  12:49:12.240  AVERAGE price = 184.11   MAX quantity = 488   COUNT = 5
-  12:49:12.356  AVERAGE price = 184.50   MAX quantity = 486   COUNT = 5
+tsdb> SELECT AVERAGE, COUNT
+   ->   WHERE ticker = NVDA OR ticker = TSLA
+   ->   GROUP BY symbol;
+New query SELECT AVERAGE price, COUNT WHERE symbol=NVDA OR symbol=TSLA GROUP BY symbol: 0 of the 5 trade(s) in the window match. WINDOW; watches it.
+
+tsdb> WINDOW;
+Watching SELECT AVERAGE price, COUNT WHERE symbol=NVDA OR symbol=TSLA GROUP BY symbol over a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
+  (empty)
+      AVERAGE price GROUP BY symbol: (no trades)
+      COUNT GROUP BY symbol: (no trades)
+  11:50:08.664
+      AVERAGE price GROUP BY symbol: TSLA 103.88
+      COUNT GROUP BY symbol: TSLA 1
                                                    <- Enter
-Stopped watching. The generator keeps running; STOP DATA stops it.
+Stopped watching. The generator keeps running; STOP DATA; stops it.
 
-tsdb> AGGREGATE AVERAGE, COUNT GROUP BY symbol
-Watching AVERAGE price GROUP BY symbol, COUNT GROUP BY symbol of every trade in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
-  12:49:12.484
-      AVERAGE price GROUP BY symbol: AAPL 89.40   GOOG 202.22   MSFT 88.32   TSLA 339.68
-      COUNT GROUP BY symbol: AAPL 1   GOOG 2   MSFT 1   TSLA 1
-  12:49:12.549
-      AVERAGE price GROUP BY symbol: AAPL 89.25   GOOG 201.80   MSFT 88.32   TSLA 339.68
-      COUNT GROUP BY symbol: AAPL 2   GOOG 1   MSFT 1   TSLA 1
+tsdb> ALSO WHERE side = buy;
+Query is now SELECT AVERAGE price, COUNT WHERE (symbol=NVDA OR symbol=TSLA) AND side=BUY GROUP BY symbol: 0 of 1 trade(s) still match. WINDOW; watches it.
+
+tsdb> ALSO SELECT MAX qty;
+Query is now SELECT AVERAGE price, COUNT, MAX quantity WHERE (symbol=NVDA OR symbol=TSLA) AND side=BUY GROUP BY symbol: 0 of 0 trade(s) still match. WINDOW; watches it.
+
+tsdb> WINDOW;
+Watching SELECT AVERAGE price, COUNT, MAX quantity WHERE (symbol=NVDA OR symbol=TSLA) AND side=BUY GROUP BY symbol over a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
+  (empty)
+      AVERAGE price GROUP BY symbol: (no trades)
+      COUNT GROUP BY symbol: (no trades)
+      MAX quantity GROUP BY symbol: (no trades)
+  11:50:09.433
+      AVERAGE price GROUP BY symbol: NVDA 467.02
+      COUNT GROUP BY symbol: NVDA 1
+      MAX quantity GROUP BY symbol: NVDA 63
                                                    <- Enter
-Stopped watching. The generator keeps running; STOP DATA stops it.
+Stopped watching. The generator keeps running; STOP DATA; stops it.
 
-tsdb> FILTER ticker = nvda or ticker = tsla
-New query symbol=NVDA OR symbol=TSLA: 0 of the 5 trade(s) in the window match.
+tsdb> STOP DATA;
+Stopped the generator after 22 trade(s). The window can still be queried; GENERATE DATA starts over.
 
-tsdb> ALSO FILTER side = buy AGGREGATE AVERAGE, COUNT
-Query narrowed to (symbol=NVDA OR symbol=TSLA) AND side=BUY: 0 of 0 trade(s) still match.
-Watching AVERAGE price, COUNT of (symbol=NVDA OR symbol=TSLA) AND side=BUY in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
-  (empty)       AVERAGE price = NaN   COUNT = 0
-  12:49:12.882  AVERAGE price = 338.75   COUNT = 1
-ALSO FILTER price < 1000                           <- typed while watching; keeps the aggregates
-Query narrowed to (symbol=NVDA OR symbol=TSLA) AND side=BUY AND price<1000: 1 of 1 trade(s) still match.
-Watching AVERAGE price, COUNT of (symbol=NVDA OR symbol=TSLA) AND side=BUY AND price<1000 in a count-based window (last 5 point(s)). A new line prints whenever a value changes. Press Enter to stop.
-  12:49:12.882  AVERAGE price = 338.75   COUNT = 1
-                                                   <- Enter
-Stopped watching. The generator keeps running; STOP DATA stops it.
+tsdb> SELECT COUNT, MIN, MAX;
+New query SELECT COUNT, MIN price, MAX price: 5 of the 5 trade(s) in the window match. WINDOW; watches it.
 
-tsdb> STOP DATA
-Stopped the generator after 36 trade(s). The window can still be queried; GENERATE DATA starts over.
-
-tsdb> AGGREGATE MAX qty GROUP BY ticker
-Showing MAX quantity GROUP BY symbol of (symbol=NVDA OR symbol=TSLA) AND side=BUY AND price<1000 in a count-based window (last 5 point(s)). The generator is stopped, so this won't change.
-  12:49:12.882
-      MAX quantity GROUP BY symbol: TSLA 5
+tsdb> WINDOW;
+Showing SELECT COUNT, MIN price, MAX price over a count-based window (last 5 point(s)). The generator is stopped, so this won't change.
+  11:50:09.617  COUNT = 5   MIN price = 132.76   MAX price = 472.30
 ```
 
 ### Storage layer
@@ -436,6 +473,7 @@ VERSION 3  ✅ done
 
 VERSION 4  ✅ done
   Compound filter conditions (AND/OR)
+  SQL-like shell language: SELECT ... WHERE ... GROUP BY ...;  ALSO to refine;  WINDOW to watch
 
 STORAGE LAYER  ✅ done (first step toward Version 5)
   Append-only disk log: every trade is stored, survives restarts, and can be
